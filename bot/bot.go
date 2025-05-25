@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,223 @@ import (
 var BotToken string
 var voiceConnections = make(map[string]*discordgo.VoiceConnection)
 var encoder *opus.Encoder
+
+// Add this near the top with other global variables
+var tempFiles = make(map[string][]string) // guildID -> list of temp files
+var tempFilesMu sync.RWMutex
+
+// Modified killGuildOperations function
+func killGuildOperations(guildID string) {
+	operationsMu.Lock()
+	defer operationsMu.Unlock()
+
+	// Kill any active operations for this guild
+	for opID, op := range activeOperations {
+		if strings.Contains(opID, guildID) {
+			op.cancel()
+			delete(activeOperations, opID)
+		}
+	}
+
+	// Stop voice playback
+	botManager.mu.Lock()
+	defer botManager.mu.Unlock()
+
+	if session, exists := botManager.voiceConnections[guildID]; exists {
+		session.cancel()
+		session.mu.Lock()
+		session.isPlaying = false
+		session.mu.Unlock()
+	}
+
+	// Clean up temp files for this guild
+	cleanupTempFiles(guildID)
+}
+
+// Modified killAllOperations function
+func killAllOperations() {
+	operationsMu.Lock()
+	defer operationsMu.Unlock()
+
+	for opID, op := range activeOperations {
+		op.cancel()
+		delete(activeOperations, opID)
+	}
+
+	botManager.mu.Lock()
+	defer botManager.mu.Unlock()
+
+	for guildID, session := range botManager.voiceConnections {
+		session.cancel()
+		if session.connection != nil {
+			session.connection.Disconnect()
+		}
+		delete(botManager.voiceConnections, guildID)
+	}
+
+	// Clean up all temp files
+	cleanupAllTempFiles()
+}
+
+// Add these new functions for temp file management
+func addTempFile(guildID, filename string) {
+	tempFilesMu.Lock()
+	defer tempFilesMu.Unlock()
+
+	if tempFiles[guildID] == nil {
+		tempFiles[guildID] = make([]string, 0)
+	}
+	tempFiles[guildID] = append(tempFiles[guildID], filename)
+}
+
+func removeTempFile(guildID, filename string) {
+	tempFilesMu.Lock()
+	defer tempFilesMu.Unlock()
+
+	if files, exists := tempFiles[guildID]; exists {
+		for i, file := range files {
+			if file == filename {
+				tempFiles[guildID] = append(files[:i], files[i+1:]...)
+				break
+			}
+		}
+		// Clean up empty slice
+		if len(tempFiles[guildID]) == 0 {
+			delete(tempFiles, guildID)
+		}
+	}
+
+	// Remove the actual file
+	os.Remove(filename)
+}
+
+func cleanupTempFiles(guildID string) {
+	tempFilesMu.Lock()
+	defer tempFilesMu.Unlock()
+
+	if files, exists := tempFiles[guildID]; exists {
+		for _, filename := range files {
+			os.Remove(filename)
+			log.Printf("Cleaned up temp file: %s", filename)
+		}
+		delete(tempFiles, guildID)
+	}
+}
+
+func cleanupAllTempFiles() {
+	tempFilesMu.Lock()
+	defer tempFilesMu.Unlock()
+
+	for _, files := range tempFiles {
+		for _, filename := range files {
+			os.Remove(filename)
+			log.Printf("Cleaned up temp file: %s", filename)
+		}
+	}
+	tempFiles = make(map[string][]string)
+}
+
+// Helper function to wait for file to be ready
+func waitForFile(filename string, maxWait time.Duration) error {
+	start := time.Now()
+	for time.Since(start) < maxWait {
+		if info, err := os.Stat(filename); err == nil && info.Size() > 0 {
+			// File exists and has content, wait a bit more to ensure it's fully written
+			time.Sleep(100 * time.Millisecond)
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("file %s not ready after %v", filename, maxWait)
+}
+
+// Modified downloadAndPlayYT function
+func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelID, guildID, url string) {
+	select {
+	case <-ctx.Done():
+		discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
+		return
+	default:
+	}
+
+	botManager.mu.RLock()
+	session, ok := botManager.voiceConnections[guildID]
+	botManager.mu.RUnlock()
+
+	if !ok || session == nil || session.connection == nil {
+		discord.ChannelMessageSend(channelID, "❌ Not connected to a voice channel.")
+		return
+	}
+
+	// Generate a temp file name (without extension for yt-dlp template)
+	baseFileName := fmt.Sprintf("yt_audio_%d_%d", time.Now().Unix(), rand.Intn(100000))
+	outputTemplate := baseFileName + ".%(ext)s"
+
+	// Create command with context for cancellation
+	cmd := exec.CommandContext(ctx, "yt-dlp", "-x", "--audio-format", "mp3", "-o", outputTemplate, url)
+
+	discord.ChannelMessageSend(channelID, "⬇️ Downloading YouTube audio...")
+
+	// Capture command output for debugging
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
+		} else {
+			discord.ChannelMessageSend(channelID, "❌ Failed to download audio.")
+			log.Printf("yt-dlp error: %v\nOutput: %s", err, string(output))
+		}
+		return
+	}
+
+	// The actual filename will have .mp3 extension
+	actualFileName := baseFileName + ".mp3"
+
+	// Check if file exists
+	if _, err := os.Stat(actualFileName); os.IsNotExist(err) {
+		// Try alternative extensions that yt-dlp might use
+		alternatives := []string{".webm", ".m4a", ".opus", ".ogg"}
+		found := false
+		for _, ext := range alternatives {
+			testName := baseFileName + ext
+			if _, err := os.Stat(testName); err == nil {
+				// Convert to mp3 using ffmpeg
+				convertCmd := exec.CommandContext(ctx, "ffmpeg", "-i", testName, "-acodec", "mp3", actualFileName)
+				convertErr := convertCmd.Run()
+				if convertErr == nil {
+					os.Remove(testName) // Remove original file
+					found = true
+					break
+				} else {
+					log.Printf("Failed to convert %s to mp3: %v", testName, convertErr)
+				}
+			}
+		}
+
+		if !found {
+			discord.ChannelMessageSend(channelID, "❌ Downloaded file not found or conversion failed.")
+			log.Printf("Expected file %s not found", actualFileName)
+			return
+		}
+	}
+
+	// Wait for file to be ready
+	if err := waitForFile(actualFileName, 5*time.Second); err != nil {
+		discord.ChannelMessageSend(channelID, "❌ File not ready: "+err.Error())
+		return
+	}
+
+	// Add temp file to tracking
+	addTempFile(guildID, actualFileName)
+
+	discord.ChannelMessageSend(channelID, "🎵 Playing downloaded YouTube audio...")
+	playMP3(session, actualFileName, discord, channelID)
+
+	// Cleanup after a delay to ensure playback completes, but also remove from tracking
+	time.AfterFunc(5*time.Minute, func() {
+		removeTempFile(guildID, actualFileName)
+	})
+}
 
 // Global context and cancellation for managing bot operations
 type BotManager struct {
@@ -75,53 +293,6 @@ func Run() {
 	// Cleanup all active operations before shutdown
 	killAllOperations()
 	discord.Close()
-}
-
-// Kill all active operations
-func killAllOperations() {
-	operationsMu.Lock()
-	defer operationsMu.Unlock()
-
-	for opID, op := range activeOperations {
-		op.cancel()
-		delete(activeOperations, opID)
-	}
-
-	botManager.mu.Lock()
-	defer botManager.mu.Unlock()
-
-	for guildID, session := range botManager.voiceConnections {
-		session.cancel()
-		if session.connection != nil {
-			session.connection.Disconnect()
-		}
-		delete(botManager.voiceConnections, guildID)
-	}
-}
-
-// Kill operations for a specific guild
-func killGuildOperations(guildID string) {
-	operationsMu.Lock()
-	defer operationsMu.Unlock()
-
-	// Kill any active operations for this guild
-	for opID, op := range activeOperations {
-		if strings.Contains(opID, guildID) {
-			op.cancel()
-			delete(activeOperations, opID)
-		}
-	}
-
-	// Stop voice playback
-	botManager.mu.Lock()
-	defer botManager.mu.Unlock()
-
-	if session, exists := botManager.voiceConnections[guildID]; exists {
-		session.cancel()
-		session.mu.Lock()
-		session.isPlaying = false
-		session.mu.Unlock()
-	}
 }
 
 // Create a new operation context
@@ -192,98 +363,7 @@ func getGeminiResponse(ctx context.Context, prompt string) (string, error) {
 	return response, nil
 }
 
-func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelID, guildID, url string) {
-	select {
-	case <-ctx.Done():
-		discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
-		return
-	default:
-	}
-
-	botManager.mu.RLock()
-	session, ok := botManager.voiceConnections[guildID]
-	botManager.mu.RUnlock()
-
-	if !ok || session == nil || session.connection == nil {
-		discord.ChannelMessageSend(channelID, "❌ Not connected to a voice channel.")
-		return
-	}
-
-	// Generate a temp file name (without extension for yt-dlp template)
-	baseFileName := fmt.Sprintf("yt_audio_%d_%d", time.Now().Unix(), rand.Intn(100000))
-	outputTemplate := baseFileName + ".%(ext)s"
-
-	// Create command with context for cancellation
-	cmd := exec.CommandContext(ctx, "yt-dlp", "-x", "--audio-format", "mp3", "-o", outputTemplate, url)
-
-	discord.ChannelMessageSend(channelID, "⬇️ Downloading YouTube audio...")
-
-	// Capture command output for debugging
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if ctx.Err() != nil {
-			discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
-		} else {
-			discord.ChannelMessageSend(channelID, "❌ Failed to download audio.")
-			log.Printf("yt-dlp error: %v\nOutput: %s", err, string(output))
-		}
-		return
-	}
-
-	// The actual filename will have .mp3 extension
-	actualFileName := baseFileName + ".mp3"
-
-	// Check if file exists
-	if _, err := os.Stat(actualFileName); os.IsNotExist(err) {
-		// Try alternative extensions that yt-dlp might use
-		alternatives := []string{".webm", ".m4a", ".opus", ".ogg"}
-		found := false
-		for _, ext := range alternatives {
-			testName := baseFileName + ext
-			if _, err := os.Stat(testName); err == nil {
-				// Convert to mp3 using ffmpeg
-				convertCmd := exec.CommandContext(ctx, "ffmpeg", "-i", testName, "-acodec", "mp3", actualFileName)
-				convertErr := convertCmd.Run()
-				if convertErr == nil {
-					os.Remove(testName) // Remove original file
-					found = true
-					break
-				} else {
-					log.Printf("Failed to convert %s to mp3: %v", testName, convertErr)
-				}
-			}
-		}
-
-		if !found {
-			discord.ChannelMessageSend(channelID, "❌ Downloaded file not found or conversion failed.")
-			log.Printf("Expected file %s not found", actualFileName)
-			return
-		}
-	}
-
-	// Verify file exists and has content
-	fileInfo, err := os.Stat(actualFileName)
-	if err != nil {
-		discord.ChannelMessageSend(channelID, "❌ Failed to access downloaded file.")
-		log.Printf("File stat error: %v", err)
-		return
-	}
-
-	if fileInfo.Size() == 0 {
-		discord.ChannelMessageSend(channelID, "❌ Downloaded file is empty.")
-		os.Remove(actualFileName)
-		return
-	}
-
-	discord.ChannelMessageSend(channelID, "🎵 Playing downloaded YouTube audio...")
-	playMP3(session, actualFileName, discord, channelID)
-
-	// Cleanup after a delay to ensure playback completes
-	time.AfterFunc(5*time.Minute, func() {
-		os.Remove(actualFileName)
-	})
-}
-
+// Modified synthesizeToMP3 with better error handling and file verification
 func synthesizeToMP3(ctx context.Context, text string, filename string) error {
 	err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "tts-cred.json")
 	if err != nil {
@@ -315,11 +395,27 @@ func synthesizeToMP3(ctx context.Context, text string, filename string) error {
 		return fmt.Errorf("SynthesizeSpeech: %w", err)
 	}
 
+	// Ensure directory exists
+	dir := filepath.Dir(filename)
+	if dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory: %w", err)
+		}
+	}
+
 	err = ioutil.WriteFile(filename, resp.AudioContent, 0644)
 	if err != nil {
 		return fmt.Errorf("ioutil.WriteFile: %w", err)
 	}
 
+	// Verify file was written correctly
+	if info, err := os.Stat(filename); err != nil {
+		return fmt.Errorf("failed to verify file: %w", err)
+	} else if info.Size() == 0 {
+		return fmt.Errorf("generated file is empty")
+	}
+
+	log.Printf("Successfully created TTS file: %s (size: %d bytes)", filename)
 	return nil
 }
 
@@ -463,7 +559,7 @@ func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.Message
 	}()
 }
 
-// Fixed message handler with better error handling for Gemini
+// Fixed message handler with better synchronous processing for file operations
 func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	if message.Author == nil || message.Author.ID == discord.State.User.ID {
 		return
@@ -538,31 +634,49 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			ctx := createOperationContext(opID)
 			defer removeOperationContext(opID)
 
+			log.Printf("Starting TTS synthesis for file: %s", filename)
 			err := synthesizeToMP3(ctx, text, filename)
 			if err != nil {
 				if ctx.Err() != nil {
 					discord.ChannelMessageSend(message.ChannelID, "❌ TTS operation cancelled.")
 				} else {
 					discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
+					log.Printf("TTS error: %v", err)
 				}
 				return
 			}
 
-			botConnect(discord, message)
-
-			customMsg := &discordgo.MessageCreate{
-				Message: &discordgo.Message{
-					Content:   "!play " + filename,
-					ChannelID: message.ChannelID,
-					GuildID:   message.GuildID,
-				},
+			// Wait for file to be ready before proceeding
+			if err := waitForFile(filename, 10*time.Second); err != nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready: "+err.Error())
+				os.Remove(filename)
+				return
 			}
 
-			soundPlay(discord, customMsg)
+			// Add to temp file tracking
+			addTempFile(guildID, filename)
+
+			if !botConnect(discord, message) {
+				removeTempFile(guildID, filename)
+				return
+			}
+
+			botManager.mu.RLock()
+			session, ok := botManager.voiceConnections[guildID]
+			botManager.mu.RUnlock()
+
+			if !ok || session == nil || session.connection == nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ Bot is not connected to a voice channel.")
+				removeTempFile(guildID, filename)
+				return
+			}
+
+			log.Printf("Playing TTS file: %s", filename)
+			playMP3(session, filename, discord, message.ChannelID)
 
 			// Clean up file after a delay
 			time.AfterFunc(30*time.Second, func() {
-				os.Remove(filename)
+				removeTempFile(guildID, filename)
 			})
 		}()
 
@@ -601,31 +715,50 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			discord.ChannelMessageSend(message.ChannelID, reply)
 
 			filename := fmt.Sprintf("gemini_output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+
+			log.Printf("Starting TTS synthesis for Gemini response file: %s", filename)
 			err = synthesizeToMP3(ctx, reply, filename)
 			if err != nil {
 				if ctx.Err() != nil {
 					discord.ChannelMessageSend(message.ChannelID, "❌ TTS operation cancelled.")
 				} else {
 					discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
+					log.Printf("TTS error for Gemini response: %v", err)
 				}
 				return
 			}
 
-			botConnect(discord, message)
-
-			customMsg := &discordgo.MessageCreate{
-				Message: &discordgo.Message{
-					Content:   "!play " + filename,
-					ChannelID: message.ChannelID,
-					GuildID:   message.GuildID,
-				},
+			// Wait for file to be ready
+			if err := waitForFile(filename, 10*time.Second); err != nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready: "+err.Error())
+				os.Remove(filename)
+				return
 			}
 
-			soundPlay(discord, customMsg)
+			// Add to temp file tracking
+			addTempFile(guildID, filename)
+
+			if !botConnect(discord, message) {
+				removeTempFile(guildID, filename)
+				return
+			}
+
+			botManager.mu.RLock()
+			session, ok := botManager.voiceConnections[guildID]
+			botManager.mu.RUnlock()
+
+			if !ok || session == nil || session.connection == nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ Bot is not connected to a voice channel.")
+				removeTempFile(guildID, filename)
+				return
+			}
+
+			log.Printf("Playing Gemini TTS file: %s", filename)
+			playMP3(session, filename, discord, message.ChannelID)
 
 			// Clean up file after a delay
 			time.AfterFunc(30*time.Second, func() {
-				os.Remove(filename)
+				removeTempFile(guildID, filename)
 			})
 		}()
 
@@ -641,6 +774,19 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			downloadAndPlayYT(ctx, discord, message.ChannelID, message.GuildID, url)
 		}()
 	}
+}
+
+func pcmToOpus(pcm []int16) []byte {
+	if encoder == nil {
+		var err error
+		encoder, err = opus.NewEncoder(48000, 2, opus.AppAudio)
+		checkNilErr(err)
+	}
+
+	opusBuf := make([]byte, 1000)
+	n, err := encoder.Encode(pcm, opusBuf)
+	checkNilErr(err)
+	return opusBuf[:n]
 }
 
 func playMP3(session *VoiceSession, filename string, discord *discordgo.Session, channelID string) {
@@ -660,6 +806,20 @@ func playMP3(session *VoiceSession, filename string, discord *discordgo.Session,
 
 	vc := session.connection
 	if vc == nil {
+		return
+	}
+
+	// Wait for file to be fully ready before attempting to play
+	if err := waitForFileReady(filename, 15*time.Second); err != nil {
+		discord.ChannelMessageSend(channelID, "❌ Audio file not ready: "+err.Error())
+		log.Printf("File not ready for playback: %v", err)
+		return
+	}
+
+	// Additional verification - try to open and check file integrity
+	if err := verifyAudioFile(filename); err != nil {
+		discord.ChannelMessageSend(channelID, "❌ Audio file verification failed: "+err.Error())
+		log.Printf("File verification failed: %v", err)
 		return
 	}
 
@@ -709,15 +869,75 @@ func playMP3(session *VoiceSession, filename string, discord *discordgo.Session,
 	cmd.Wait()
 }
 
-func pcmToOpus(pcm []int16) []byte {
-	if encoder == nil {
-		var err error
-		encoder, err = opus.NewEncoder(48000, 2, opus.AppAudio)
-		checkNilErr(err)
+// Enhanced file readiness check with better validation
+func waitForFileReady(filename string, maxWait time.Duration) error {
+	start := time.Now()
+	var lastSize int64 = -1
+	stableCount := 0
+
+	for time.Since(start) < maxWait {
+		info, err := os.Stat(filename)
+		if err != nil {
+			if os.IsNotExist(err) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("file stat error: %w", err)
+		}
+
+		currentSize := info.Size()
+
+		// File must have content
+		if currentSize == 0 {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Check if file size is stable (not still being written to)
+		if currentSize == lastSize {
+			stableCount++
+			// File size has been stable for at least 500ms
+			if stableCount >= 5 {
+				// Additional check - try to open file to ensure it's not locked
+				file, err := os.OpenFile(filename, os.O_RDONLY, 0)
+				if err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				file.Close()
+
+				log.Printf("File %s is ready (size: %d bytes, stable for %dms)",
+					filename, currentSize, stableCount*100)
+				return nil
+			}
+		} else {
+			stableCount = 0
+			lastSize = currentSize
+		}
+
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	opusBuf := make([]byte, 1000)
-	n, err := encoder.Encode(pcm, opusBuf)
-	checkNilErr(err)
-	return opusBuf[:n]
+	return fmt.Errorf("file %s not ready after %v (last size: %d)", filename, maxWait, lastSize)
+}
+
+// Verify audio file integrity before attempting to play
+func verifyAudioFile(filename string) error {
+	// Quick ffprobe check to verify file integrity
+	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
+		"-show_entries", "stream=duration", "-of", "csv=p=0", filename)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffprobe verification failed: %w (output: %s)", err, string(output))
+	}
+
+	// If ffprobe can read the file and get duration, it's likely valid
+	outputStr := strings.TrimSpace(string(output))
+	if outputStr == "" || outputStr == "N/A" {
+		return fmt.Errorf("file appears to be invalid or corrupted")
+	}
+
+	log.Printf("Audio file verified successfully (duration: %s)", outputStr)
+	return nil
 }
