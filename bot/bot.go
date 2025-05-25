@@ -26,11 +26,40 @@ var BotToken string
 var voiceConnections = make(map[string]*discordgo.VoiceConnection)
 var encoder *opus.Encoder
 
-// Add this near the top with other global variables
 var tempFiles = make(map[string][]string) // guildID -> list of temp files
 var tempFilesMu sync.RWMutex
 
-// Modified killGuildOperations function
+var activeOperations = make(map[string]*OperationContext)
+var operationsMu sync.RWMutex
+
+type BotManager struct {
+	voiceConnections map[string]*VoiceSession
+	mu               sync.RWMutex
+}
+
+type VoiceSession struct {
+	connection *discordgo.VoiceConnection
+	ctx        context.Context
+	cancel     context.CancelFunc
+	isPlaying  bool
+	mu         sync.RWMutex
+}
+
+var botManager = &BotManager{
+	voiceConnections: make(map[string]*VoiceSession),
+}
+
+type OperationContext struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func checkNilErr(e error) {
+	if e != nil {
+		log.Fatal(e)
+	}
+}
+
 func killGuildOperations(guildID string) {
 	operationsMu.Lock()
 	defer operationsMu.Unlock()
@@ -58,7 +87,6 @@ func killGuildOperations(guildID string) {
 	cleanupTempFiles(guildID)
 }
 
-// Modified killAllOperations function
 func killAllOperations() {
 	operationsMu.Lock()
 	defer operationsMu.Unlock()
@@ -83,7 +111,6 @@ func killAllOperations() {
 	cleanupAllTempFiles()
 }
 
-// Add these new functions for temp file management
 func addTempFile(guildID, filename string) {
 	tempFilesMu.Lock()
 	defer tempFilesMu.Unlock()
@@ -141,21 +168,6 @@ func cleanupAllTempFiles() {
 	tempFiles = make(map[string][]string)
 }
 
-// Helper function to wait for file to be ready
-func waitForFile(filename string, maxWait time.Duration) error {
-	start := time.Now()
-	for time.Since(start) < maxWait {
-		if info, err := os.Stat(filename); err == nil && info.Size() > 0 {
-			// File exists and has content, wait a bit more to ensure it's fully written
-			time.Sleep(100 * time.Millisecond)
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return fmt.Errorf("file %s not ready after %v", filename, maxWait)
-}
-
-// Modified downloadAndPlayYT function
 func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelID, guildID, url string) {
 	select {
 	case <-ctx.Done():
@@ -226,7 +238,7 @@ func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelI
 	}
 
 	// Wait for file to be ready
-	if err := waitForFile(actualFileName, 5*time.Second); err != nil {
+	if err := waitForfileReady(actualFileName, 5*time.Second); err != nil {
 		discord.ChannelMessageSend(channelID, "❌ File not ready: "+err.Error())
 		return
 	}
@@ -241,39 +253,6 @@ func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelI
 	time.AfterFunc(5*time.Minute, func() {
 		removeTempFile(guildID, actualFileName)
 	})
-}
-
-// Global context and cancellation for managing bot operations
-type BotManager struct {
-	voiceConnections map[string]*VoiceSession
-	mu               sync.RWMutex
-}
-
-type VoiceSession struct {
-	connection *discordgo.VoiceConnection
-	ctx        context.Context
-	cancel     context.CancelFunc
-	isPlaying  bool
-	mu         sync.RWMutex
-}
-
-var botManager = &BotManager{
-	voiceConnections: make(map[string]*VoiceSession),
-}
-
-// Context for long-running operations
-type OperationContext struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-}
-
-var activeOperations = make(map[string]*OperationContext)
-var operationsMu sync.RWMutex
-
-func checkNilErr(e error) {
-	if e != nil {
-		log.Fatal(e)
-	}
 }
 
 func Run() {
@@ -341,7 +320,7 @@ func getGeminiResponse(ctx context.Context, prompt string) (string, error) {
 		" : END OF EXAMPLES " +
 		": BRAIN AND THOUGHT PROCESSES : {In your response DO NOT just use one or all the examples given; Take those examples, using your LLM database of information (on google) and come " +
 		"  up and respond with different crazy ideas I want your response to have a proper conclusion and if asked a QUESTION given AN ANSWER to it}\n"
-	promptEnd := "Return a crazy response to this statement prompt:{" + prompt + "} with a statement you would say : (only the response : make sure your RESPONSE IS UNDER 4000 characters)\n"
+	promptEnd := "Return a crazy response to this statement prompt:{" + prompt + "} with a statement you would say : (only the response : make sure your RESPONSE IS UNDER 3000 characters)\n"
 	totalPrompt := promptIntro + promptTheories + promptEnd
 
 	result, err := client.Models.GenerateContent(
@@ -363,7 +342,6 @@ func getGeminiResponse(ctx context.Context, prompt string) (string, error) {
 	return response, nil
 }
 
-// Modified synthesizeToMP3 with better error handling and file verification
 func synthesizeToMP3(ctx context.Context, text string, filename string) error {
 	err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "tts-cred.json")
 	if err != nil {
@@ -452,6 +430,7 @@ func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bo
 	}
 
 	voiceState, err := discord.State.VoiceState(guildID, message.Author.ID)
+
 	if err != nil {
 		discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get voice state.")
 		return false
@@ -559,7 +538,6 @@ func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.Message
 	}()
 }
 
-// Fixed message handler with better synchronous processing for file operations
 func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	if message.Author == nil || message.Author.ID == discord.State.User.ID {
 		return
@@ -647,7 +625,7 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			}
 
 			// Wait for file to be ready before proceeding
-			if err := waitForFile(filename, 10*time.Second); err != nil {
+			if err := waitForfileReady(filename, 10*time.Second); err != nil {
 				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready: "+err.Error())
 				os.Remove(filename)
 				return
@@ -729,7 +707,7 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			}
 
 			// Wait for file to be ready
-			if err := waitForFile(filename, 10*time.Second); err != nil {
+			if err := waitForfileReady(filename, 10*time.Second); err != nil {
 				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready: "+err.Error())
 				os.Remove(filename)
 				return
@@ -810,7 +788,7 @@ func playMP3(session *VoiceSession, filename string, discord *discordgo.Session,
 	}
 
 	// Wait for file to be fully ready before attempting to play
-	if err := waitForFileReady(filename, 15*time.Second); err != nil {
+	if err := waitForfileReady(filename, 15*time.Second); err != nil {
 		discord.ChannelMessageSend(channelID, "❌ Audio file not ready: "+err.Error())
 		log.Printf("File not ready for playback: %v", err)
 		return
@@ -869,8 +847,7 @@ func playMP3(session *VoiceSession, filename string, discord *discordgo.Session,
 	cmd.Wait()
 }
 
-// Enhanced file readiness check with better validation
-func waitForFileReady(filename string, maxWait time.Duration) error {
+func waitForfileReady(filename string, maxWait time.Duration) error {
 	start := time.Now()
 	var lastSize int64 = -1
 	stableCount := 0
