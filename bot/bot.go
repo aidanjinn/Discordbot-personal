@@ -164,7 +164,9 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			}
 
 			log.Printf("Playing TTS file: %s", filename)
-			playMP3(session, filename, discord, message.ChannelID)
+			done := make(chan bool)
+			playMP3(session, filename, discord, message.ChannelID, done)
+			<-done
 			removeTempFile(guildID, filename)
 		}()
 
@@ -241,8 +243,9 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 				return
 			}
 
-			log.Printf("Playing Gemini TTS file: %s", filename)
-			playMP3(session, filename, discord, message.ChannelID)
+			done := make(chan bool)
+			playMP3(session, filename, discord, message.ChannelID, done)
+			<-done
 			removeTempFile(guildID, filename)
 		}()
 

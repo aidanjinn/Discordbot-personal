@@ -98,7 +98,9 @@ func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelI
 	addTempFile(guildID, actualFileName)
 
 	discord.ChannelMessageSend(channelID, "🎵 Playing downloaded YouTube audio...")
-	playMP3(session, actualFileName, discord, channelID)
+	done := make(chan bool)
+	playMP3(session, actualFileName, discord, channelID, done)
+	<-done
 	removeTempFile(guildID, actualFileName)
 }
 
@@ -171,7 +173,9 @@ func soundPlay(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	}
 
 	// Play in goroutine to avoid blocking
-	go playMP3(session, mp3, discord, message.ChannelID)
+	done := make(chan bool)
+	go playMP3(session, mp3, discord, message.ChannelID, done)
+	<-done
 }
 
 func pcmToOpus(pcm []int16) []byte {
@@ -187,85 +191,88 @@ func pcmToOpus(pcm []int16) []byte {
 	return opusBuf[:n]
 }
 
-func playMP3(session *VoiceSession, filename string, discord *discordgo.Session, channelID string) {
-	session.mu.Lock()
-	if session.isPlaying {
-		session.mu.Unlock()
-		return // Already playing something
-	}
-	session.isPlaying = true
-	session.mu.Unlock()
+func playMP3(session *VoiceSession, filename string, discord *discordgo.Session, channelID string, done chan bool) {
+	go func() {
+		// Ensure done is always signaled, even on early return
+		defer func() {
+			session.mu.Lock()
+			session.isPlaying = false
+			session.mu.Unlock()
+			done <- true
+		}()
 
-	defer func() {
 		session.mu.Lock()
-		session.isPlaying = false
+		if session.isPlaying {
+			session.mu.Unlock()
+			return // Already playing something
+		}
+		session.isPlaying = true
 		session.mu.Unlock()
-	}()
 
-	vc := session.connection
-	if vc == nil {
-		return
-	}
-
-	// Wait for file to be fully ready before attempting to play
-	if err := waitForfileReady(filename, 15*time.Second); err != nil {
-		discord.ChannelMessageSend(channelID, "❌ Audio file not ready: "+err.Error())
-		log.Printf("File not ready for playback: %v", err)
-		return
-	}
-
-	// Additional verification - try to open and check file integrity
-	if err := verifyAudioFile(filename); err != nil {
-		discord.ChannelMessageSend(channelID, "❌ Audio file verification failed: "+err.Error())
-		log.Printf("File verification failed: %v", err)
-		return
-	}
-
-	vc.Speaking(true)
-	defer vc.Speaking(false)
-
-	// Create command with context for cancellation
-	cmd := exec.CommandContext(session.ctx, "ffmpeg", "-i", filename, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
-	stdout, err := cmd.StdoutPipe()
-
-	if err != nil {
-		discord.ChannelMessageSend(channelID, "❌ Failed to stream audio.")
-		log.Println("Failed to create ffmpeg pipe:", err)
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		discord.ChannelMessageSend(channelID, "❌ ffmpeg failed to start.")
-		log.Println("ffmpeg start failed:", err)
-		return
-	}
-
-	reader := bufio.NewReaderSize(stdout, 16384)
-
-	for {
-		// Check if context is cancelled
-		select {
-		case <-session.ctx.Done():
-			cmd.Process.Kill()
+		vc := session.connection
+		if vc == nil {
+			log.Println("No active voice connection.")
 			return
-		default:
 		}
 
-		buf := make([]int16, 960*2)
-		err := binary.Read(reader, binary.LittleEndian, &buf)
+		// Wait for file to be ready
+		if err := waitForfileReady(filename, 15*time.Second); err != nil {
+			discord.ChannelMessageSend(channelID, "❌ Audio file not ready: "+err.Error())
+			log.Printf("File not ready for playback: %v", err)
+			return
+		}
+
+		// Verify file integrity
+		if err := verifyAudioFile(filename); err != nil {
+			discord.ChannelMessageSend(channelID, "❌ Audio file verification failed: "+err.Error())
+			log.Printf("File verification failed: %v", err)
+			return
+		}
+
+		vc.Speaking(true)
+		defer vc.Speaking(false)
+
+		// Start ffmpeg
+		cmd := exec.CommandContext(session.ctx, "ffmpeg", "-i", filename, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
+		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			break
-		}
-
-		select {
-		case vc.OpusSend <- pcmToOpus(buf):
-		case <-session.ctx.Done():
-			cmd.Process.Kill()
+			discord.ChannelMessageSend(channelID, "❌ Failed to stream audio.")
+			log.Println("Failed to create ffmpeg pipe:", err)
 			return
 		}
-	}
 
-	cmd.Wait()
+		if err := cmd.Start(); err != nil {
+			discord.ChannelMessageSend(channelID, "❌ ffmpeg failed to start.")
+			log.Println("ffmpeg start failed:", err)
+			return
+		}
+
+		reader := bufio.NewReaderSize(stdout, 16384)
+
+		for {
+			select {
+			case <-session.ctx.Done():
+				cmd.Process.Kill()
+				return
+			default:
+			}
+
+			buf := make([]int16, 960*2)
+			err := binary.Read(reader, binary.LittleEndian, &buf)
+			if err != nil {
+				break
+			}
+
+			select {
+			case vc.OpusSend <- pcmToOpus(buf):
+			case <-session.ctx.Done():
+				cmd.Process.Kill()
+				return
+			}
+		}
+
+		cmd.Wait()
+	}()
 }
 
 // Verify audio file integrity before attempting to play
