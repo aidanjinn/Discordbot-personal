@@ -2,30 +2,56 @@ package bot
 
 import (
 	"bufio"
+	texttospeech "cloud.google.com/go/texttospeech/apiv1"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/hraban/opus"
+	"google.golang.org/genai"
+	texttospeechpb "google.golang.org/genproto/googleapis/cloud/texttospeech/v1"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
+	"time"
 )
 
-/*
-Global Vars: (later shift some of these inside a bot struct to call)
-
-	BotToken -> Pulled From .ENV File used to for Discord Connection
-	voiceConnections -> Current Channel Connections (For use in voice channel connections)
-	encode -> used for the mp3 Encoder/Piper for audio file playing
-*/
 var BotToken string
-var voiceConnections = make(map[string]*discordgo.VoiceConnection) // guildID -> VoiceConnection
+var voiceConnections = make(map[string]*discordgo.VoiceConnection)
 var encoder *opus.Encoder
 
-// Standard Golang Error Handling
+// Global context and cancellation for managing bot operations
+type BotManager struct {
+	voiceConnections map[string]*VoiceSession
+	mu               sync.RWMutex
+}
+
+type VoiceSession struct {
+	connection *discordgo.VoiceConnection
+	ctx        context.Context
+	cancel     context.CancelFunc
+	isPlaying  bool
+	mu         sync.RWMutex
+}
+
+var botManager = &BotManager{
+	voiceConnections: make(map[string]*VoiceSession),
+}
+
+// Context for long-running operations
+type OperationContext struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+var activeOperations = make(map[string]*OperationContext)
+var operationsMu sync.RWMutex
+
 func checkNilErr(e error) {
 	if e != nil {
 		log.Fatal(e)
@@ -46,46 +72,276 @@ func Run() {
 	signal.Notify(c, os.Interrupt)
 	<-c
 
+	// Cleanup all active operations before shutdown
+	killAllOperations()
 	discord.Close()
 }
 
-/*
-Method Check for if Bot is current within the same voice channel as requester (User)
+// Kill all active operations
+func killAllOperations() {
+	operationsMu.Lock()
+	defer operationsMu.Unlock()
 
-	If so True Else False
-	Used in determining if a connect needs to occur
-*/
+	for opID, op := range activeOperations {
+		op.cancel()
+		delete(activeOperations, opID)
+	}
+
+	botManager.mu.Lock()
+	defer botManager.mu.Unlock()
+
+	for guildID, session := range botManager.voiceConnections {
+		session.cancel()
+		if session.connection != nil {
+			session.connection.Disconnect()
+		}
+		delete(botManager.voiceConnections, guildID)
+	}
+}
+
+// Kill operations for a specific guild
+func killGuildOperations(guildID string) {
+	operationsMu.Lock()
+	defer operationsMu.Unlock()
+
+	// Kill any active operations for this guild
+	for opID, op := range activeOperations {
+		if strings.Contains(opID, guildID) {
+			op.cancel()
+			delete(activeOperations, opID)
+		}
+	}
+
+	// Stop voice playback
+	botManager.mu.Lock()
+	defer botManager.mu.Unlock()
+
+	if session, exists := botManager.voiceConnections[guildID]; exists {
+		session.cancel()
+		session.mu.Lock()
+		session.isPlaying = false
+		session.mu.Unlock()
+	}
+}
+
+// Create a new operation context
+func createOperationContext(operationID string) context.Context {
+	operationsMu.Lock()
+	defer operationsMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	activeOperations[operationID] = &OperationContext{
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	return ctx
+}
+
+// Remove operation context
+func removeOperationContext(operationID string) {
+	operationsMu.Lock()
+	defer operationsMu.Unlock()
+
+	if op, exists := activeOperations[operationID]; exists {
+		op.cancel()
+		delete(activeOperations, operationID)
+	}
+}
+
+// Fixed Gemini response function using the official Google AI Go SDK
+func getGeminiResponse(ctx context.Context, prompt string) (string, error) {
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("GEMINI_API_KEY is not set")
+	}
+
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to create Gemini client: %w", err)
+	}
+
+	promptIntro := "You are a crazy schizophrenia, conspiracy believing, paranoid old chinese man named Wang, and you speak with a fuckton curse words\n"
+	promptTheories := "Here is a list of theories : {alien's bring bigfoot to earth 10000 years ago to protect them from dinosaurs while the mined gold on earth, elites buying children to harvest adrenochrome, MKUltra," +
+		" The government poisoning the water to turn the youth and frogs gay, Agartha, anunnaki, and babylonians}" +
+		" : END OF EXAMPLES " +
+		": BRAIN AND THOUGHT PROCESSES : {In your response DO NOT just use one or all the examples given; Take those examples, using your LLM database of information (on google) and come " +
+		"  up and respond with different crazy ideas I want your response to have a proper conclusion and if asked a QUESTION given AN ANSWER to it}\n"
+	promptEnd := "Return a crazy response to this statement prompt:{" + prompt + "} with a statement you would say : (only the response : make sure your RESPONSE IS UNDER 4000 characters)\n"
+	totalPrompt := promptIntro + promptTheories + promptEnd
+
+	result, err := client.Models.GenerateContent(
+		ctx,
+		"gemini-2.0-flash",
+		genai.Text(totalPrompt),
+		nil,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate content: %w", err)
+	}
+
+	response := result.Text()
+
+	if response == "" {
+		return "", fmt.Errorf("empty response from Gemini")
+	}
+
+	return response, nil
+}
+
+func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelID, guildID, url string) {
+	select {
+	case <-ctx.Done():
+		discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
+		return
+	default:
+	}
+
+	botManager.mu.RLock()
+	session, ok := botManager.voiceConnections[guildID]
+	botManager.mu.RUnlock()
+
+	if !ok || session == nil || session.connection == nil {
+		discord.ChannelMessageSend(channelID, "❌ Not connected to a voice channel.")
+		return
+	}
+
+	// Generate a temp file name (without extension for yt-dlp template)
+	baseFileName := fmt.Sprintf("yt_audio_%d_%d", time.Now().Unix(), rand.Intn(100000))
+	outputTemplate := baseFileName + ".%(ext)s"
+
+	// Create command with context for cancellation
+	cmd := exec.CommandContext(ctx, "yt-dlp", "-x", "--audio-format", "mp3", "-o", outputTemplate, url)
+
+	discord.ChannelMessageSend(channelID, "⬇️ Downloading YouTube audio...")
+
+	// Capture command output for debugging
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
+		} else {
+			discord.ChannelMessageSend(channelID, "❌ Failed to download audio.")
+			log.Printf("yt-dlp error: %v\nOutput: %s", err, string(output))
+		}
+		return
+	}
+
+	// The actual filename will have .mp3 extension
+	actualFileName := baseFileName + ".mp3"
+
+	// Check if file exists
+	if _, err := os.Stat(actualFileName); os.IsNotExist(err) {
+		// Try alternative extensions that yt-dlp might use
+		alternatives := []string{".webm", ".m4a", ".opus", ".ogg"}
+		found := false
+		for _, ext := range alternatives {
+			testName := baseFileName + ext
+			if _, err := os.Stat(testName); err == nil {
+				// Convert to mp3 using ffmpeg
+				convertCmd := exec.CommandContext(ctx, "ffmpeg", "-i", testName, "-acodec", "mp3", actualFileName)
+				convertErr := convertCmd.Run()
+				if convertErr == nil {
+					os.Remove(testName) // Remove original file
+					found = true
+					break
+				} else {
+					log.Printf("Failed to convert %s to mp3: %v", testName, convertErr)
+				}
+			}
+		}
+
+		if !found {
+			discord.ChannelMessageSend(channelID, "❌ Downloaded file not found or conversion failed.")
+			log.Printf("Expected file %s not found", actualFileName)
+			return
+		}
+	}
+
+	// Verify file exists and has content
+	fileInfo, err := os.Stat(actualFileName)
+	if err != nil {
+		discord.ChannelMessageSend(channelID, "❌ Failed to access downloaded file.")
+		log.Printf("File stat error: %v", err)
+		return
+	}
+
+	if fileInfo.Size() == 0 {
+		discord.ChannelMessageSend(channelID, "❌ Downloaded file is empty.")
+		os.Remove(actualFileName)
+		return
+	}
+
+	discord.ChannelMessageSend(channelID, "🎵 Playing downloaded YouTube audio...")
+	playMP3(session, actualFileName, discord, channelID)
+
+	// Cleanup after a delay to ensure playback completes
+	time.AfterFunc(5*time.Minute, func() {
+		os.Remove(actualFileName)
+	})
+}
+
+func synthesizeToMP3(ctx context.Context, text string, filename string) error {
+	err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "tts-cred.json")
+	if err != nil {
+		return fmt.Errorf("failed to set credentials env: %w", err)
+	}
+
+	client, err := texttospeech.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("texttospeech.NewClient: %w", err)
+	}
+	defer client.Close()
+
+	req := &texttospeechpb.SynthesizeSpeechRequest{
+		Input: &texttospeechpb.SynthesisInput{
+			InputSource: &texttospeechpb.SynthesisInput_Text{Text: strings.ToLower(text)},
+		},
+		Voice: &texttospeechpb.VoiceSelectionParams{
+			LanguageCode: "cmn-CN",
+			Name:         "cmn-CN-Chirp3-HD-Achird",
+			SsmlGender:   texttospeechpb.SsmlVoiceGender_MALE,
+		},
+		AudioConfig: &texttospeechpb.AudioConfig{
+			AudioEncoding: texttospeechpb.AudioEncoding_MP3,
+		},
+	}
+
+	resp, err := client.SynthesizeSpeech(ctx, req)
+	if err != nil {
+		return fmt.Errorf("SynthesizeSpeech: %w", err)
+	}
+
+	err = ioutil.WriteFile(filename, resp.AudioContent, 0644)
+	if err != nil {
+		return fmt.Errorf("ioutil.WriteFile: %w", err)
+	}
+
+	return nil
+}
+
 func botIsInSameVoiceChannel(discord *discordgo.Session, guildID, userID string) bool {
-	// Get user's voice state
 	userVoiceState, err := discord.State.VoiceState(guildID, userID)
 
-	// If any of these conditions trigger the user not in any voice channel
 	if userVoiceState == nil || userVoiceState.ChannelID == "" || err != nil {
 		return false
 	}
 
-	// Then we see if bot is connected in this guild
-	vc, ok := voiceConnections[guildID]
-	if !ok || vc == nil {
+	botManager.mu.RLock()
+	session, ok := botManager.voiceConnections[guildID]
+	botManager.mu.RUnlock()
+
+	if !ok || session == nil || session.connection == nil {
 		return false
 	}
 
-	// Finally we compare the bot's channel with the user's channel (to see if both are in the same voice channel)
-	return vc.ChannelID == userVoiceState.ChannelID
+	return session.connection.ChannelID == userVoiceState.ChannelID
 }
 
-/*
-Method for init. a bot connection the requesters voice channel
-
-	Checks:
-		1) We see if the bot is already within the same channel as the user
-			-> note this check also includes checks for if the user is within a channel, or the bot is in the server already
-		2) Seeing if the Requester is joined the guild/server
-		3) Seeing if the Requester if within a voice channel
-		Once we passed the these checks then we init. a connection (the bot to join the voice channel the user is within)
-*/
 func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bool {
-
 	discord.ChannelMessageSend(message.ChannelID, "Attempting Connection...")
 	guildID := message.GuildID
 
@@ -100,7 +356,10 @@ func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bo
 	}
 
 	voiceState, err := discord.State.VoiceState(guildID, message.Author.ID)
-	checkNilErr(err)
+	if err != nil {
+		discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get voice state.")
+		return false
+	}
 
 	if voiceState == nil || voiceState.ChannelID == "" {
 		discord.ChannelMessageSend(message.ChannelID, "User is not connected to a voice channel.")
@@ -108,149 +367,307 @@ func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bo
 	}
 
 	vc, err := discord.ChannelVoiceJoin(guildID, voiceState.ChannelID, false, false)
-	checkNilErr(err)
-
-	voiceConnections[guildID] = vc
-	discord.ChannelMessageSend(message.ChannelID, "✅ Connected to Voice Channel")
-
-	customMsg := &discordgo.MessageCreate{
-		Message: &discordgo.Message{
-			Content:   "!play Heyooo.mp3",
-			ChannelID: message.ChannelID,
-			GuildID:   message.GuildID,
-		},
+	if err != nil {
+		discord.ChannelMessageSend(message.ChannelID, "❌ Failed to join voice channel.")
+		return false
 	}
-	soundPlay(discord, customMsg)
 
+	// Create new voice session with context
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &VoiceSession{
+		connection: vc,
+		ctx:        ctx,
+		cancel:     cancel,
+		isPlaying:  false,
+	}
+
+	botManager.mu.Lock()
+	botManager.voiceConnections[guildID] = session
+	botManager.mu.Unlock()
+
+	discord.ChannelMessageSend(message.ChannelID, "✅ Connected to Voice Channel")
 	return true
 }
 
 func soundPlay(discord *discordgo.Session, message *discordgo.MessageCreate) {
-
 	mp3 := strings.TrimSpace(strings.TrimPrefix(message.Content, "!play "))
 	guildID := message.GuildID
-	vc, ok := voiceConnections[guildID]
 
-	if !ok || vc == nil {
+	botManager.mu.RLock()
+	session, ok := botManager.voiceConnections[guildID]
+	botManager.mu.RUnlock()
+
+	if !ok || session == nil || session.connection == nil {
 		discord.ChannelMessageSend(message.ChannelID, "❌ Bot is not connected to a voice channel.")
 		return
 	}
 
-	go playMP3(vc, mp3, discord, message.ChannelID)
+	// Play in goroutine to avoid blocking
+	go playMP3(session, mp3, discord, message.ChannelID)
 }
 
 func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	guildID := message.GuildID
 
-	// Fetch all channels and filter out voice channels
-	channels, err := discord.GuildChannels(guildID)
-	checkNilErr(err)
-
-	var voiceChannels []string
-	for _, channel := range channels {
-		if channel.Type == discordgo.ChannelTypeGuildVoice {
-			voiceChannels = append(voiceChannels, channel.ID)
-		}
-	}
-
-	if len(voiceChannels) < 1 {
-		discord.ChannelMessageSend(message.ChannelID, "❌ No voice channels found.")
-		return
-	}
-
-	// Fetch guild voice states (users in voice channels)
-	guild, err := discord.State.Guild(guildID)
-	checkNilErr(err)
-
-	var usersInVoice []*discordgo.VoiceState
-	for _, vs := range guild.VoiceStates {
-		usersInVoice = append(usersInVoice, vs)
-	}
-
-	if len(usersInVoice) < 1 {
-		discord.ChannelMessageSend(message.ChannelID, "❌ No users in voice channels to shuffle.")
-		return
-	}
-
-	// Shuffle users
-	rand.Shuffle(len(usersInVoice), func(i, j int) {
-		usersInVoice[i], usersInVoice[j] = usersInVoice[j], usersInVoice[i]
-	})
-
-	// Assign each user to a voice channel, cycling through them
-	for i, vs := range usersInVoice {
-		targetChannel := voiceChannels[i%len(voiceChannels)]
-		err := discord.GuildMemberMove(guildID, vs.UserID, &targetChannel)
+	// Run in goroutine to avoid blocking
+	go func() {
+		channels, err := discord.GuildChannels(guildID)
 		if err != nil {
-			log.Printf("Failed to move user %s: %v", vs.UserID, err)
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get guild channels.")
+			return
 		}
-	}
 
-	discord.ChannelMessageSend(message.ChannelID, "🔀 Shuffled users into random voice channels.")
+		var voiceChannels []string
+		for _, channel := range channels {
+			if channel.Type == discordgo.ChannelTypeGuildVoice {
+				voiceChannels = append(voiceChannels, channel.ID)
+			}
+		}
+
+		if len(voiceChannels) < 1 {
+			discord.ChannelMessageSend(message.ChannelID, "❌ No voice channels found.")
+			return
+		}
+
+		guild, err := discord.State.Guild(guildID)
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get guild state.")
+			return
+		}
+
+		var usersInVoice []*discordgo.VoiceState
+		for _, vs := range guild.VoiceStates {
+			if vs.ChannelID != "" { // Only users actually in voice channels
+				usersInVoice = append(usersInVoice, vs)
+			}
+		}
+
+		if len(usersInVoice) < 1 {
+			discord.ChannelMessageSend(message.ChannelID, "❌ No users in voice channels to shuffle.")
+			return
+		}
+
+		rand.Shuffle(len(usersInVoice), func(i, j int) {
+			usersInVoice[i], usersInVoice[j] = usersInVoice[j], usersInVoice[i]
+		})
+
+		for i, vs := range usersInVoice {
+			targetChannel := voiceChannels[i%len(voiceChannels)]
+			err := discord.GuildMemberMove(guildID, vs.UserID, &targetChannel)
+			if err != nil {
+				log.Printf("Failed to move user %s: %v", vs.UserID, err)
+			}
+		}
+
+		discord.ChannelMessageSend(message.ChannelID, "🔀 Shuffled users into random voice channels.")
+	}()
 }
 
-/*
-Message Handler Containing the case logic for supported commands
-
-	!help -> command list
-	!cum -> this is just a custom sound play
-	!play -> play 'filename.mp3'
-	!connect
-	!disconnect
-*/
+// Fixed message handler with better error handling for Gemini
 func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
-
 	if message.Author == nil || message.Author.ID == discord.State.User.ID {
 		return
 	}
 
-	switch {
+	guildID := message.GuildID
 
+	switch {
 	case strings.Contains(message.Content, "!help"):
-		commandList := "\t!help -> command list\n\t!cum -> this is just a custom sound play\n\t!play -> play 'filename.mp3' : Heyooo.mp3 and Lorenzofuckingdies.mp3\n\t!connect\n\t!disconnect"
+		commandList := "\t!help -> command list\n\t!cum -> this is just a custom sound play\n\t!play -> play 'filename.mp3' : Heyooo.mp3 and Lorenzofuckingdies.mp3\n\t!connect\n\t!disconnect\n\t!ask -> ask Gemini AI\n\t!say -> text-to-speech\n\t!ytplay -> play YouTube audio\n\t!shuffle -> shuffle users in voice channels\n\t!kill -> stop all current bot actions"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
-	case strings.Contains(message.Content, "!shuffle 1024"):
+	case strings.Contains(message.Content, "!kill"):
+		killGuildOperations(guildID)
+		discord.ChannelMessageSend(message.ChannelID, "🛑 Killed all active operations for this server.")
+
+	case strings.Contains(message.Content, "!shuffle"):
 		shuffleVoiceChannels(discord, message)
 
 	case strings.Contains(message.Content, "!cum"):
-
-		botConnect(discord, message)
-
-		customMsg := &discordgo.MessageCreate{
-			Message: &discordgo.Message{
-				Content:   "!play Lorenzofuckingdies.mp3",
-				ChannelID: message.ChannelID,
-				GuildID:   message.GuildID,
-			},
-		}
-		soundPlay(discord, customMsg)
+		go func() {
+			botConnect(discord, message)
+			customMsg := &discordgo.MessageCreate{
+				Message: &discordgo.Message{
+					Content:   "!play Lorenzofuckingdies.mp3",
+					ChannelID: message.ChannelID,
+					GuildID:   message.GuildID,
+				},
+			}
+			soundPlay(discord, customMsg)
+		}()
 
 	case strings.HasPrefix(message.Content, "!play "):
-		botConnect(discord, message)
-		soundPlay(discord, message)
+		go func() {
+			botConnect(discord, message)
+			soundPlay(discord, message)
+		}()
 
 	case strings.Contains(message.Content, "!connect"):
-		botConnect(discord, message)
+		go func() {
+			botConnect(discord, message)
+			customMsg := &discordgo.MessageCreate{
+				Message: &discordgo.Message{
+					Content:   "!play Heyooo.mp3",
+					ChannelID: message.ChannelID,
+					GuildID:   message.GuildID,
+				},
+			}
+			soundPlay(discord, customMsg)
+		}()
 
 	case strings.Contains(message.Content, "!disconnect"):
-		guildID := message.GuildID
-		if vc, ok := voiceConnections[guildID]; ok && vc != nil {
-			err := vc.Disconnect()
-			checkNilErr(err)
-			delete(voiceConnections, guildID)
+		botManager.mu.Lock()
+		if session, ok := botManager.voiceConnections[guildID]; ok && session != nil {
+			session.cancel()
+			if session.connection != nil {
+				session.connection.Disconnect()
+			}
+			delete(botManager.voiceConnections, guildID)
 			discord.ChannelMessageSend(message.ChannelID, "Good Bye 👋")
 		} else {
 			discord.ChannelMessageSend(message.ChannelID, "I'm not connected to a voice channel in this guild.")
 		}
+		botManager.mu.Unlock()
+
+	case strings.HasPrefix(message.Content, "!say "):
+		go func() {
+			text := strings.TrimPrefix(message.Content, "!say ")
+			filename := fmt.Sprintf("output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+
+			opID := fmt.Sprintf("tts_%s_%d", guildID, time.Now().Unix())
+			ctx := createOperationContext(opID)
+			defer removeOperationContext(opID)
+
+			err := synthesizeToMP3(ctx, text, filename)
+			if err != nil {
+				if ctx.Err() != nil {
+					discord.ChannelMessageSend(message.ChannelID, "❌ TTS operation cancelled.")
+				} else {
+					discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
+				}
+				return
+			}
+
+			botConnect(discord, message)
+
+			customMsg := &discordgo.MessageCreate{
+				Message: &discordgo.Message{
+					Content:   "!play " + filename,
+					ChannelID: message.ChannelID,
+					GuildID:   message.GuildID,
+				},
+			}
+
+			soundPlay(discord, customMsg)
+
+			// Clean up file after a delay
+			time.AfterFunc(30*time.Second, func() {
+				os.Remove(filename)
+			})
+		}()
+
+	case strings.HasPrefix(message.Content, "!ask "):
+		go func() {
+			discord.ChannelMessageSend(message.ChannelID, "🤖 Thinking...")
+
+			text := strings.TrimPrefix(message.Content, "!ask ")
+
+			opID := fmt.Sprintf("gemini_%s_%d", guildID, time.Now().Unix())
+			ctx := createOperationContext(opID)
+			defer removeOperationContext(opID)
+
+			log.Printf("Gemini prompt: %s", text)
+
+			reply, err := getGeminiResponse(ctx, text)
+			if err != nil {
+				if ctx.Err() != nil {
+					discord.ChannelMessageSend(message.ChannelID, "❌ Gemini operation cancelled.")
+				} else {
+					log.Printf("Gemini error: %v", err)
+					discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get response from Gemini: "+err.Error())
+				}
+				return
+			}
+
+			log.Printf("Gemini response: %s", reply)
+
+			// Split long messages if needed (Discord has a 2000 character limit)
+			if len(reply) > 2000 {
+				for len(reply) > 2000 {
+					discord.ChannelMessageSend(message.ChannelID, reply[:2000])
+					reply = reply[2000:]
+				}
+			}
+			discord.ChannelMessageSend(message.ChannelID, reply)
+
+			filename := fmt.Sprintf("gemini_output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+			err = synthesizeToMP3(ctx, reply, filename)
+			if err != nil {
+				if ctx.Err() != nil {
+					discord.ChannelMessageSend(message.ChannelID, "❌ TTS operation cancelled.")
+				} else {
+					discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
+				}
+				return
+			}
+
+			botConnect(discord, message)
+
+			customMsg := &discordgo.MessageCreate{
+				Message: &discordgo.Message{
+					Content:   "!play " + filename,
+					ChannelID: message.ChannelID,
+					GuildID:   message.GuildID,
+				},
+			}
+
+			soundPlay(discord, customMsg)
+
+			// Clean up file after a delay
+			time.AfterFunc(30*time.Second, func() {
+				os.Remove(filename)
+			})
+		}()
+
+	case strings.HasPrefix(message.Content, "!ytplay "):
+		go func() {
+			botConnect(discord, message)
+			url := strings.TrimSpace(strings.TrimPrefix(message.Content, "!ytplay "))
+
+			opID := fmt.Sprintf("youtube_%s_%d", guildID, time.Now().Unix())
+			ctx := createOperationContext(opID)
+			defer removeOperationContext(opID)
+
+			downloadAndPlayYT(ctx, discord, message.ChannelID, message.GuildID, url)
+		}()
 	}
 }
 
-func playMP3(vc *discordgo.VoiceConnection, filename string, discord *discordgo.Session, channelID string) {
+func playMP3(session *VoiceSession, filename string, discord *discordgo.Session, channelID string) {
+	session.mu.Lock()
+	if session.isPlaying {
+		session.mu.Unlock()
+		return // Already playing something
+	}
+	session.isPlaying = true
+	session.mu.Unlock()
+
+	defer func() {
+		session.mu.Lock()
+		session.isPlaying = false
+		session.mu.Unlock()
+	}()
+
+	vc := session.connection
+	if vc == nil {
+		return
+	}
+
 	vc.Speaking(true)
 	defer vc.Speaking(false)
 
-	cmd := exec.Command("ffmpeg", "-i", filename, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
+	// Create command with context for cancellation
+	cmd := exec.CommandContext(session.ctx, "ffmpeg", "-i", filename, "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1")
 	stdout, err := cmd.StdoutPipe()
 
 	if err != nil {
@@ -267,19 +684,32 @@ func playMP3(vc *discordgo.VoiceConnection, filename string, discord *discordgo.
 
 	reader := bufio.NewReaderSize(stdout, 16384)
 	for {
-		buf := make([]int16, 960*2) // 20ms of stereo
+		// Check if context is cancelled
+		select {
+		case <-session.ctx.Done():
+			cmd.Process.Kill()
+			return
+		default:
+		}
+
+		buf := make([]int16, 960*2)
 		err := binary.Read(reader, binary.LittleEndian, &buf)
 		if err != nil {
 			break
 		}
-		vc.OpusSend <- pcmToOpus(buf)
+
+		select {
+		case vc.OpusSend <- pcmToOpus(buf):
+		case <-session.ctx.Done():
+			cmd.Process.Kill()
+			return
+		}
 	}
 
 	cmd.Wait()
 }
 
 func pcmToOpus(pcm []int16) []byte {
-
 	if encoder == nil {
 		var err error
 		encoder, err = opus.NewEncoder(48000, 2, opus.AppAudio)
