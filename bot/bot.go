@@ -64,7 +64,7 @@ func killGuildOperations(guildID string) {
 	operationsMu.Lock()
 	defer operationsMu.Unlock()
 
-	// Kill any active operations for this guild
+	// Kill any active operations for this guild!
 	for opID, op := range activeOperations {
 		if strings.Contains(opID, guildID) {
 			op.cancel()
@@ -81,6 +81,8 @@ func killGuildOperations(guildID string) {
 		session.mu.Lock()
 		session.isPlaying = false
 		session.mu.Unlock()
+
+		delete(botManager.voiceConnections, guildID)
 	}
 
 	// Clean up temp files for this guild
