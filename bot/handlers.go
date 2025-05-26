@@ -364,6 +364,33 @@ func askHandler(discord *discordgo.Session, message *discordgo.MessageCreate, gu
 	}()
 }
 
+func imageGenerationHandler(discord *discordgo.Session, message *discordgo.MessageCreate, prompt string, guildID string) {
+	go func() {
+		discord.ChannelMessageSend(message.ChannelID, "🎨 Generating image for prompt: *"+prompt+"*...")
+
+		ctx := context.Background()
+		filename, err := generateImageFromPrompt(ctx, prompt, "")
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to generate image: "+err.Error())
+			return
+		}
+
+		file, err := os.Open(filename)
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to open generated image.")
+			return
+		}
+		defer file.Close()
+
+		discord.ChannelFileSend(message.ChannelID, filename, file)
+
+		// Clean up file after a delay
+		time.AfterFunc(30*time.Second, func() {
+			removeTempFile(guildID, filename)
+		})
+	}()
+}
+
 func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	if message.Author == nil || message.Author.ID == discord.State.User.ID {
 		return
@@ -388,6 +415,7 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			"📞 !recall      → Summon the whole squad to voice\n" +
 			"🛑 !kill        → Stop all current bot actions\n" +
 			"🔫 !shoot        → Wang Bot Shoots a Random User\n" +
+			"🎨 !create      → Ask Wang Bot To Create an Image\n" +
 			"```"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
@@ -499,5 +527,12 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 		go func() {
 			randomMoveSingle(discord, message)
 		}()
+
+	case strings.HasPrefix(message.Content, "!create "):
+		go func() {
+			trimmed := strings.TrimPrefix(message.Content, "!create ")
+			imageGenerationHandler(discord, message, trimmed, guildID)
+		}()
 	}
+
 }

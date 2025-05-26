@@ -93,3 +93,75 @@ func imageProcess(ctx context.Context, imagePath string, prompt string) (string,
 
 	return response.Text(), nil
 }
+
+func generateImageFromPrompt(ctx context.Context, prompt string, imagePath string) (string, error) {
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("GEMINI_API_KEY is not set")
+	}
+
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Gemini client: %w", err)
+	}
+
+	var parts []*genai.Part
+
+	// Include text prompt
+	parts = append(parts, genai.NewPartFromText(prompt))
+
+	// Optional: add user image if provided
+	if imagePath != "" {
+		imgData, err := os.ReadFile(imagePath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read image: %w", err)
+		}
+		parts = append(parts, &genai.Part{
+			InlineData: &genai.Blob{
+				MIMEType: "image/png", // adjust if needed
+				Data:     imgData,
+			},
+		})
+	}
+
+	contents := []*genai.Content{
+		genai.NewContentFromParts(parts, genai.RoleUser),
+	}
+
+	config := &genai.GenerateContentConfig{
+		ResponseModalities: []string{"TEXT", "IMAGE"},
+	}
+
+	result, err := client.Models.GenerateContent(
+		ctx,
+		"gemini-2.0-flash-preview-image-generation",
+		contents,
+		config,
+	)
+	if err != nil {
+		return "", fmt.Errorf("Gemini image generation error: %w", err)
+	}
+
+	var outputFilename string
+	for _, part := range result.Candidates[0].Content.Parts {
+		if part.Text != "" {
+			fmt.Println("Text response:", part.Text) // Optional
+		} else if part.InlineData != nil {
+			imageBytes := part.InlineData.Data
+			outputFilename = "gemini_generated_image.png"
+			err := os.WriteFile(outputFilename, imageBytes, 0644)
+			if err != nil {
+				return "", fmt.Errorf("failed to write image: %w", err)
+			}
+		}
+	}
+
+	if outputFilename == "" {
+		return "", fmt.Errorf("no image was generated")
+	}
+
+	return outputFilename, nil
+}
