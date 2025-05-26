@@ -11,6 +11,51 @@ import (
 	"time"
 )
 
+func sayHandler(discord *discordgo.Session, message *discordgo.MessageCreate, ttsText string) {
+	go func() {
+		filename := fmt.Sprintf("output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+		guildID := message.GuildID
+		opID := fmt.Sprintf("tts_gamble_%s_%d", guildID, time.Now().Unix())
+		ctx := createOperationContext(opID)
+		defer removeOperationContext(opID)
+
+		log.Printf("TTS result: %s", ttsText)
+		err := synthesizeToMP3(ctx, ttsText, filename)
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
+			return
+		}
+
+		if err := waitForfileReady(filename, 10*time.Second); err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready.")
+			os.Remove(filename)
+			return
+		}
+
+		addTempFile(guildID, filename)
+
+		if !botConnect(discord, message) {
+			removeTempFile(guildID, filename)
+			return
+		}
+
+		// Play synthesized audio
+		msg := &discordgo.MessageCreate{
+			Message: &discordgo.Message{
+				Content:   "!play " + filename,
+				ChannelID: message.ChannelID,
+				GuildID:   message.GuildID,
+			},
+		}
+		soundPlay(discord, msg)
+
+		// Clean up file after a delay
+		time.AfterFunc(30*time.Second, func() {
+			removeTempFile(guildID, filename)
+		})
+	}()
+}
+
 func botIsInSameVoiceChannel(discord *discordgo.Session, guildID, userID string) bool {
 	userVoiceState, err := discord.State.VoiceState(guildID, userID)
 
@@ -215,50 +260,72 @@ func slotMachine(discord *discordgo.Session, message *discordgo.MessageCreate) {
 		}
 
 		discord.ChannelMessageSend(message.ChannelID, output)
+		sayHandler(discord, message, ttsText)
+	}()
+}
 
-		// Trigger "!say" behavior using same code flow
-		go func() {
-			filename := fmt.Sprintf("output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
-			guildID := message.GuildID
-			opID := fmt.Sprintf("tts_gamble_%s_%d", guildID, time.Now().Unix())
-			ctx := createOperationContext(opID)
-			defer removeOperationContext(opID)
+func handleImageMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
+	attachment := message.Attachments[0]
+	imageURL := attachment.URL
+	filename := attachment.Filename
+	prompt := strings.TrimSpace(strings.Replace(message.Content, "!see", "", 1))
 
-			log.Printf("TTS for gamble result: %s", ttsText)
-			err := synthesizeToMP3(ctx, ttsText, filename)
-			if err != nil {
-				discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
-				return
+	imagePath, err := downloadAttachment(imageURL, filename)
+	if err != nil {
+		discord.ChannelMessageSend(message.ChannelID, "Failed to download image.")
+		return
+	}
+	defer os.Remove(imagePath) // cleanup
+
+	ctx := context.Background()
+	response, err := imageProcess(ctx, imagePath, prompt)
+	if err != nil {
+		discord.ChannelMessageSend(message.ChannelID, "Gemini image processing failed: "+err.Error())
+		return
+	}
+
+	// Ensure response fits in Discord message
+	if len(response) > 2000 {
+		response = response[:1997] + "..."
+	}
+
+	discord.ChannelMessageSend(message.ChannelID, response)
+	sayHandler(discord, message, response)
+}
+
+func askHandler(discord *discordgo.Session, message *discordgo.MessageCreate, guildID string) {
+	go func() {
+		discord.ChannelMessageSend(message.ChannelID, "🤖 Thinking...")
+		text := strings.TrimPrefix(message.Content, "!ask ")
+
+		opID := fmt.Sprintf("gemini_%s_%d", guildID, time.Now().Unix())
+		ctx := createOperationContext(opID)
+		defer removeOperationContext(opID)
+
+		log.Printf("Gemini prompt: %s", text)
+
+		reply, err := getGeminiResponse(ctx, text)
+		if err != nil {
+			if ctx.Err() != nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ Gemini operation cancelled.")
+			} else {
+				log.Printf("Gemini error: %v", err)
+				discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get response from Gemini: "+err.Error())
 			}
+			return
+		}
 
-			if err := waitForfileReady(filename, 10*time.Second); err != nil {
-				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready.")
-				os.Remove(filename)
-				return
+		log.Printf("Gemini response: %s", reply)
+
+		if len(reply) > 2000 {
+			for len(reply) > 2000 {
+				discord.ChannelMessageSend(message.ChannelID, reply[:2000])
+				reply = reply[2000:]
 			}
-
-			addTempFile(guildID, filename)
-
-			if !botConnect(discord, message) {
-				removeTempFile(guildID, filename)
-				return
-			}
-
-			// Play synthesized audio
-			msg := &discordgo.MessageCreate{
-				Message: &discordgo.Message{
-					Content:   "!play " + filename,
-					ChannelID: message.ChannelID,
-					GuildID:   message.GuildID,
-				},
-			}
-			soundPlay(discord, msg)
-
-			// Clean up file after a delay
-			time.AfterFunc(30*time.Second, func() {
-				removeTempFile(guildID, filename)
-			})
-		}()
+		}
+		discord.ChannelMessageSend(message.ChannelID, reply)
+		fmt.Sprintf("gemini_output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+		sayHandler(discord, message, reply)
 	}()
 }
 
@@ -332,140 +399,26 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 
 	case strings.HasPrefix(message.Content, "!say "):
 		go func() {
-			text := strings.TrimPrefix(message.Content, "!say ")
-			filename := fmt.Sprintf("output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+			sayHandler(discord, message, message.Content)
+		}()
 
-			opID := fmt.Sprintf("tts_%s_%d", guildID, time.Now().Unix())
-			ctx := createOperationContext(opID)
-			defer removeOperationContext(opID)
-
-			log.Printf("Starting TTS synthesis for file: %s", filename)
-			err := synthesizeToMP3(ctx, text, filename)
-			if err != nil {
-				if ctx.Err() != nil {
-					discord.ChannelMessageSend(message.ChannelID, "❌ TTS operation cancelled.")
-				} else {
-					discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
-					log.Printf("TTS error: %v", err)
-				}
-				return
-			}
-
-			// Wait for file to be ready before proceeding
-			if err := waitForfileReady(filename, 10*time.Second); err != nil {
-				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready: "+err.Error())
-				os.Remove(filename)
-				return
-			}
-
-			// Add to temp file tracking
-			addTempFile(guildID, filename)
-
-			if !botConnect(discord, message) {
-				removeTempFile(guildID, filename)
-				return
-			}
-
-			botManager.mu.RLock()
-			session, ok := botManager.voiceConnections[guildID]
-			botManager.mu.RUnlock()
-
-			if !ok || session == nil || session.connection == nil {
-				discord.ChannelMessageSend(message.ChannelID, "❌ Bot is not connected to a voice channel.")
-				removeTempFile(guildID, filename)
-				return
-			}
-
-			log.Printf("Playing TTS file: %s", filename)
-			playMP3(session, filename, discord, message.ChannelID)
-
-			// Clean up file after a delay
-			time.AfterFunc(30*time.Second, func() {
-				removeTempFile(guildID, filename)
-			})
+	case strings.HasPrefix(message.Content, "!see ") && len(message.Attachments) > 0:
+		go func() {
+			handleImageMessage(discord, message)
 		}()
 
 	case strings.HasPrefix(message.Content, "!ask "):
-		go func() {
-			discord.ChannelMessageSend(message.ChannelID, "🤖 Thinking...")
 
-			text := strings.TrimPrefix(message.Content, "!ask ")
-
-			opID := fmt.Sprintf("gemini_%s_%d", guildID, time.Now().Unix())
-			ctx := createOperationContext(opID)
-			defer removeOperationContext(opID)
-
-			log.Printf("Gemini prompt: %s", text)
-
-			reply, err := getGeminiResponse(ctx, text)
-			if err != nil {
-				if ctx.Err() != nil {
-					discord.ChannelMessageSend(message.ChannelID, "❌ Gemini operation cancelled.")
-				} else {
-					log.Printf("Gemini error: %v", err)
-					discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get response from Gemini: "+err.Error())
-				}
-				return
-			}
-
-			log.Printf("Gemini response: %s", reply)
-
-			// Split long messages if needed (Discord has a 2000 character limit)
-			if len(reply) > 2000 {
-				for len(reply) > 2000 {
-					discord.ChannelMessageSend(message.ChannelID, reply[:2000])
-					reply = reply[2000:]
-				}
-			}
-			discord.ChannelMessageSend(message.ChannelID, reply)
-
-			filename := fmt.Sprintf("gemini_output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
-
-			log.Printf("Starting TTS synthesis for Gemini response file: %s", filename)
-			err = synthesizeToMP3(ctx, reply, filename)
-			if err != nil {
-				if ctx.Err() != nil {
-					discord.ChannelMessageSend(message.ChannelID, "❌ TTS operation cancelled.")
-				} else {
-					discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
-					log.Printf("TTS error for Gemini response: %v", err)
-				}
-				return
-			}
-
-			// Wait for file to be ready
-			if err := waitForfileReady(filename, 10*time.Second); err != nil {
-				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready: "+err.Error())
-				os.Remove(filename)
-				return
-			}
-
-			// Add to temp file tracking
-			addTempFile(guildID, filename)
-
-			if !botConnect(discord, message) {
-				removeTempFile(guildID, filename)
-				return
-			}
-
-			botManager.mu.RLock()
-			session, ok := botManager.voiceConnections[guildID]
-			botManager.mu.RUnlock()
-
-			if !ok || session == nil || session.connection == nil {
-				discord.ChannelMessageSend(message.ChannelID, "❌ Bot is not connected to a voice channel.")
-				removeTempFile(guildID, filename)
-				return
-			}
-
-			log.Printf("Playing Gemini TTS file: %s", filename)
-			playMP3(session, filename, discord, message.ChannelID)
-
-			// Clean up file after a delay
-			time.AfterFunc(30*time.Second, func() {
-				removeTempFile(guildID, filename)
-			})
-		}()
+		// If !ask has an image case
+		if len(message.Attachments) > 0 {
+			go func() {
+				handleImageMessage(discord, message)
+			}()
+		} else {
+			go func() {
+				askHandler(discord, message, guildID)
+			}()
+		}
 
 	case strings.HasPrefix(message.Content, "!ytplay "):
 		go func() {
@@ -488,5 +441,6 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 		go func() {
 			joinSameChannel(discord, message)
 		}()
+
 	}
 }

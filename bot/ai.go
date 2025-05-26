@@ -51,3 +51,45 @@ func getGeminiResponse(ctx context.Context, prompt string) (string, error) {
 
 	return response, nil
 }
+
+func imageProcess(ctx context.Context, imagePath string, prompt string) (string, error) {
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("GEMINI_API_KEY is not set")
+	}
+
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:  apiKey,
+		Backend: genai.BackendGeminiAPI,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create Gemini client: %w", err)
+	}
+
+	myfile, err := client.Files.UploadFromPath(ctx, imagePath, &genai.UploadFileConfig{
+		MIMEType: "image/jpeg", // change if needed
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload image: %w", err)
+	}
+
+	promptIntro := "You are a crazy schizophrenia, conspiracy believing, paranoid old chinese man named Wang, and you speak with a fuckton curse words\n"
+	finalPrompt := promptIntro + prompt + "{Keep your response under 3000 characters}"
+
+	parts := []*genai.Part{
+		genai.NewPartFromURI(myfile.URI, myfile.MIMEType),
+		genai.NewPartFromText("\n\n"),
+		genai.NewPartFromText(finalPrompt),
+	}
+
+	contents := []*genai.Content{
+		genai.NewContentFromParts(parts, "user"),
+	}
+
+	response, err := client.Models.GenerateContent(ctx, "gemini-2.0-flash", contents, nil)
+	if err != nil {
+		return "", fmt.Errorf("Gemini generation error: %w", err)
+	}
+
+	return response.Text(), nil
+}

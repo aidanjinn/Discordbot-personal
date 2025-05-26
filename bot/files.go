@@ -2,8 +2,11 @@ package bot
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -113,4 +116,23 @@ func waitForfileReady(filename string, maxWait time.Duration) error {
 	}
 
 	return fmt.Errorf("file %s not ready after %v (last size: %d)", filename, maxWait, lastSize)
+}
+
+// Saves image and returns local path
+func downloadAttachment(url, filename string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	localPath := filepath.Join(os.TempDir(), filename)
+	out, err := os.Create(localPath)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	return localPath, err
 }
