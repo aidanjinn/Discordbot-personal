@@ -30,11 +30,9 @@ func botIsInSameVoiceChannel(discord *discordgo.Session, guildID, userID string)
 }
 
 func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bool {
-	discord.ChannelMessageSend(message.ChannelID, "Attempting Connection...")
 	guildID := message.GuildID
 
 	if botIsInSameVoiceChannel(discord, guildID, message.Author.ID) {
-		discord.ChannelMessageSend(message.ChannelID, "Already in Channel...")
 		return true
 	}
 
@@ -74,7 +72,6 @@ func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bo
 	botManager.voiceConnections[guildID] = session
 	botManager.mu.Unlock()
 
-	discord.ChannelMessageSend(message.ChannelID, "✅ Connected to Voice Channel")
 	return true
 }
 
@@ -135,6 +132,94 @@ func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.Message
 	}()
 }
 
+func slotMachine(discord *discordgo.Session, message *discordgo.MessageCreate) {
+
+	go func() {
+		icons := map[int]string{
+			0: "🍒",   // Cherries
+			1: "🍋",   // Lemon
+			2: "🔔",   // Bell
+			3: "🍀",   // Four-leaf clover
+			4: "💎",   // Diamond
+			5: "7️⃣", // Lucky 7
+			6: "🍇",   // Grapes
+			7: "🎰",   // Slot machine
+			8: "⭐",   // Star
+		}
+		var slots [3]int
+		for i := range len(slots) {
+			slots[i] = rand.Intn(9)
+		}
+		var output string
+		output += " | "
+		for _, slot := range slots {
+			output += icons[slot] + " | "
+		}
+
+		ttsText := ""
+		//Winner
+		if slots[0] == slots[1] && slots[1] == slots[2] {
+			discord.ChannelMessageSend(message.ChannelID, "You Won You Lucky Fuck\n")
+
+			botConnect(discord, message)
+			ttsText = "You Won You Lucky Fuck"
+
+		} else {
+			discord.ChannelMessageSend(message.ChannelID, "You A Fuckin Lose Dummy\n")
+
+			botConnect(discord, message)
+			ttsText = "You A Fuckin Lose Dummy"
+
+		}
+
+		discord.ChannelMessageSend(message.ChannelID, output)
+
+		// Trigger "!say" behavior using same code flow
+		go func() {
+			filename := fmt.Sprintf("output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+			guildID := message.GuildID
+			opID := fmt.Sprintf("tts_gamble_%s_%d", guildID, time.Now().Unix())
+			ctx := createOperationContext(opID)
+			defer removeOperationContext(opID)
+
+			log.Printf("TTS for gamble result: %s", ttsText)
+			err := synthesizeToMP3(ctx, ttsText, filename)
+			if err != nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
+				return
+			}
+
+			if err := waitForfileReady(filename, 10*time.Second); err != nil {
+				discord.ChannelMessageSend(message.ChannelID, "❌ TTS file not ready.")
+				os.Remove(filename)
+				return
+			}
+
+			addTempFile(guildID, filename)
+
+			if !botConnect(discord, message) {
+				removeTempFile(guildID, filename)
+				return
+			}
+
+			// Play synthesized audio
+			msg := &discordgo.MessageCreate{
+				Message: &discordgo.Message{
+					Content:   "!play " + filename,
+					ChannelID: message.ChannelID,
+					GuildID:   message.GuildID,
+				},
+			}
+			soundPlay(discord, msg)
+
+			// Clean up file after a delay
+			time.AfterFunc(30*time.Second, func() {
+				removeTempFile(guildID, filename)
+			})
+		}()
+	}()
+}
+
 func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	if message.Author == nil || message.Author.ID == discord.State.User.ID {
 		return
@@ -144,7 +229,10 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 
 	switch {
 	case strings.Contains(message.Content, "!help"):
-		commandList := "\t!help -> command list\n\t!cum -> this is just a custom sound play\n\t!play -> play 'filename.mp3' : Heyooo.mp3 and Lorenzofuckingdies.mp3\n\t!connect\n\t!disconnect\n\t!ask -> ask Gemini AI\n\t!say -> text-to-speech\n\t!ytplay -> play YouTube audio\n\t!shuffle -> shuffle users in voice channels\n\t!kill -> stop all current bot actions"
+		commandList := "\t!help -> command list\n\t!cum -> this is just a custom sound play\n\t" +
+			"!play -> play 'filename.mp3' : Heyooo.mp3 and Lorenzofuckingdies.mp3\n\t!connect\n\t!disconnect\n\t" +
+			"!ask -> ask Gemini AI\n\t!say -> text-to-speech\n\t!ytplay -> play YouTube audio\n\t!shuffle -> shuffle users in voice channels\n\t" +
+			"!kill -> stop all current bot actions\n\t!gamble -> roll the slot machine"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
 	case strings.Contains(message.Content, "!kill"):
@@ -347,6 +435,11 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			defer removeOperationContext(opID)
 
 			downloadAndPlayYT(ctx, discord, message.ChannelID, message.GuildID, url)
+		}()
+
+	case strings.Contains(message.Content, "!gamble"):
+		go func() {
+			slotMachine(discord, message)
 		}()
 	}
 }
