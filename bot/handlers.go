@@ -338,18 +338,34 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 
 	switch {
 	case strings.Contains(message.Content, "!help"):
-		commandList := "\t!help -> command list\n\t!cum -> this is just a custom sound play\n\t" +
-			"!play -> play 'filename.mp3' : Heyooo.mp3 and Lorenzofuckingdies.mp3\n\t!connect\n\t!disconnect\n\t" +
-			"!ask -> ask Gemini AI\n\t!say -> text-to-speech\n\t!ytplay -> play YouTube audio\n\t!shuffle -> shuffle users in voice channels\n\t" +
-			"!kill -> stop all current bot actions\n\t!gamble -> roll the slot machinen\n\t!recall -> summon the squad"
+		commandList := "**🎮 Wang Bot Command List:**\n" +
+			"```" +
+			"💡 !help        → Show this command list\n" +
+			"💦 !cum         → Play a cursed custom sound\n" +
+			"🎵 !play        → Play an audio file (e.g., Heyooo.mp3, Lorenzofuckingdies.mp3)\n" +
+			"📺 !ytplay      → Play audio from a YouTube link\n" +
+			"🔌 !connect     → Connect the bot to a voice channel\n" +
+			"❌ !disconnect  → Disconnect the bot from the voice channel\n" +
+			"🧠 !ask         → Ask Gemini AI (supports text + .jpg)\n" +
+			"🗣️ !say         → Make the bot speak using text-to-speech\n" +
+			"🔀 !shuffle     → Shuffle users in voice channels randomly\n" +
+			"🎰 !gamble      → Spin the slot machine (big risk, big reward)\n" +
+			"📞 !recall      → Summon the whole squad to voice\n" +
+			"🛑 !kill        → Stop all current bot actions\n" +
+			"```"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
 	case strings.Contains(message.Content, "!kill"):
-		killGuildOperations(guildID)
-		discord.ChannelMessageSend(message.ChannelID, "🛑 Killed all active operations for this server.")
+		go func() {
+			killGuildOperations(guildID)
+			discord.ChannelMessageSend(message.ChannelID, "🛑 Killed all active operations for this server.")
+
+		}()
 
 	case strings.Contains(message.Content, "!shuffle"):
-		shuffleVoiceChannels(discord, message)
+		go func() {
+			shuffleVoiceChannels(discord, message)
+		}()
 
 	case strings.Contains(message.Content, "!cum"):
 		go func() {
@@ -399,7 +415,8 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 
 	case strings.HasPrefix(message.Content, "!say "):
 		go func() {
-			sayHandler(discord, message, message.Content)
+			trimmed := strings.TrimPrefix(message.Content, "!say ")
+			sayHandler(discord, message, trimmed)
 		}()
 
 	case strings.HasPrefix(message.Content, "!see ") && len(message.Attachments) > 0:
