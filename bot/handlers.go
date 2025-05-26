@@ -75,6 +75,47 @@ func botConnect(discord *discordgo.Session, message *discordgo.MessageCreate) bo
 	return true
 }
 
+func joinSameChannel(discord *discordgo.Session, message *discordgo.MessageCreate) {
+
+	guildID := message.GuildID
+
+	go func() {
+
+		requesterVoiceState, err := discord.State.VoiceState(guildID, message.Author.ID)
+
+		if err != nil || requesterVoiceState == nil || requesterVoiceState.ChannelID == "" {
+			discord.ChannelMessageSend(message.ChannelID, "❌ You must be in a voice channel to use this command.")
+			return
+		}
+
+		targetChannelID := requesterVoiceState.ChannelID
+		guild, err := discord.State.Guild(guildID)
+
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get guild information.")
+			return
+		}
+
+		var movedCount int
+		for _, vs := range guild.VoiceStates {
+
+			if vs.UserID == message.Author.ID || vs.ChannelID == targetChannelID {
+				continue
+			}
+
+			err := discord.GuildMemberMove(guildID, vs.UserID, &targetChannelID)
+
+			if err != nil {
+				log.Printf("Failed to move user %s: %v", vs.UserID, err)
+			} else {
+				movedCount++
+			}
+		}
+		discord.ChannelMessageSend(message.ChannelID, fmt.Sprintf("📢 Moved %d user(s) to your voice channel.", movedCount))
+	}()
+
+}
+
 func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	guildID := message.GuildID
 
@@ -157,6 +198,7 @@ func slotMachine(discord *discordgo.Session, message *discordgo.MessageCreate) {
 		}
 
 		ttsText := ""
+
 		//Winner
 		if slots[0] == slots[1] && slots[1] == slots[2] {
 			discord.ChannelMessageSend(message.ChannelID, "You Won You Lucky Fuck\n")
@@ -232,7 +274,7 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 		commandList := "\t!help -> command list\n\t!cum -> this is just a custom sound play\n\t" +
 			"!play -> play 'filename.mp3' : Heyooo.mp3 and Lorenzofuckingdies.mp3\n\t!connect\n\t!disconnect\n\t" +
 			"!ask -> ask Gemini AI\n\t!say -> text-to-speech\n\t!ytplay -> play YouTube audio\n\t!shuffle -> shuffle users in voice channels\n\t" +
-			"!kill -> stop all current bot actions\n\t!gamble -> roll the slot machine"
+			"!kill -> stop all current bot actions\n\t!gamble -> roll the slot machinen\n\t!recall -> summon the squad"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
 	case strings.Contains(message.Content, "!kill"):
@@ -440,6 +482,11 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	case strings.Contains(message.Content, "!gamble"):
 		go func() {
 			slotMachine(discord, message)
+		}()
+
+	case strings.Contains(message.Content, "!recall"):
+		go func() {
+			joinSameChannel(discord, message)
 		}()
 	}
 }

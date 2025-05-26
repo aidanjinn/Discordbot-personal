@@ -20,6 +20,7 @@ import (
 )
 
 func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelID, guildID, url string) {
+
 	select {
 	case <-ctx.Done():
 		discord.ChannelMessageSend(channelID, "❌ YouTube download cancelled.")
@@ -107,6 +108,7 @@ func downloadAndPlayYT(ctx context.Context, discord *discordgo.Session, channelI
 }
 
 func synthesizeToMP3(ctx context.Context, text string, filename string) error {
+
 	err := os.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "tts-cred.json")
 	if err != nil {
 		return fmt.Errorf("failed to set credentials env: %w", err)
