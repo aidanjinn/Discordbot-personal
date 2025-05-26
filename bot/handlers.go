@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
+	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -369,7 +371,42 @@ func imageGenerationHandler(discord *discordgo.Session, message *discordgo.Messa
 		discord.ChannelMessageSend(message.ChannelID, "🎨 Generating image for prompt: *"+prompt+"*...")
 
 		ctx := context.Background()
-		filename, err := generateImageFromPrompt(ctx, prompt, "")
+		var imagePath string
+
+		// Check for image attachments
+		if len(message.Attachments) > 0 {
+
+			attachment := message.Attachments[0]
+
+			if strings.HasPrefix(attachment.ContentType, "image/") {
+				// Download image to a temp file
+				resp, err := http.Get(attachment.URL)
+				if err != nil {
+					discord.ChannelMessageSend(message.ChannelID, "❌ Failed to download attached image.")
+					return
+				}
+				defer resp.Body.Close()
+
+				tempFile, err := os.CreateTemp("", "discord_image_*.png")
+				if err != nil {
+					discord.ChannelMessageSend(message.ChannelID, "❌ Failed to create temporary image file.")
+					return
+				}
+				defer tempFile.Close()
+
+				_, err = io.Copy(tempFile, resp.Body)
+				if err != nil {
+					discord.ChannelMessageSend(message.ChannelID, "❌ Failed to save attached image.")
+					return
+				}
+
+				imagePath = tempFile.Name()
+				defer os.Remove(imagePath) // clean up local file
+			}
+		}
+
+		// Call image generator
+		filename, err := generateImageFromPrompt(ctx, prompt, imagePath)
 		if err != nil {
 			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to generate image: "+err.Error())
 			return
@@ -384,7 +421,7 @@ func imageGenerationHandler(discord *discordgo.Session, message *discordgo.Messa
 
 		discord.ChannelFileSend(message.ChannelID, filename, file)
 
-		// Clean up file after a delay
+		// Clean up generated image after 30s
 		time.AfterFunc(30*time.Second, func() {
 			removeTempFile(guildID, filename)
 		})

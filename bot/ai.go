@@ -110,27 +110,26 @@ func generateImageFromPrompt(ctx context.Context, prompt string, imagePath strin
 
 	var parts []*genai.Part
 
-	// Include text prompt
-	parts = append(parts, genai.NewPartFromText(prompt))
-
-	// Optional: add user image if provided
+	// If an image is attached, upload it and include as a reference
 	if imagePath != "" {
-		imgData, err := os.ReadFile(imagePath)
-		if err != nil {
-			return "", fmt.Errorf("failed to read image: %w", err)
-		}
-		parts = append(parts, &genai.Part{
-			InlineData: &genai.Blob{
-				MIMEType: "image/png", // adjust if needed
-				Data:     imgData,
-			},
+		mimeType := "image/png"
+
+		uploaded, err := client.Files.UploadFromPath(ctx, imagePath, &genai.UploadFileConfig{
+			MIMEType: mimeType,
 		})
+		if err != nil {
+			return "", fmt.Errorf("failed to upload image: %w", err)
+		}
+		parts = append(parts, genai.NewPartFromURI(uploaded.URI, mimeType))
 	}
+
+	parts = append(parts, genai.NewPartFromText(prompt))
 
 	contents := []*genai.Content{
 		genai.NewContentFromParts(parts, genai.RoleUser),
 	}
 
+	// Specify that you want image output
 	config := &genai.GenerateContentConfig{
 		ResponseModalities: []string{"TEXT", "IMAGE"},
 	}
@@ -148,7 +147,7 @@ func generateImageFromPrompt(ctx context.Context, prompt string, imagePath strin
 	var outputFilename string
 	for _, part := range result.Candidates[0].Content.Parts {
 		if part.Text != "" {
-			fmt.Println("Text response:", part.Text) // Optional
+			fmt.Println("Text response:", part.Text)
 		} else if part.InlineData != nil {
 			imageBytes := part.InlineData.Data
 			outputFilename = "gemini_generated_image.png"
