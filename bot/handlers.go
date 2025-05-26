@@ -21,6 +21,7 @@ func sayHandler(discord *discordgo.Session, message *discordgo.MessageCreate, tt
 
 		log.Printf("TTS result: %s", ttsText)
 		err := synthesizeToMP3(ctx, ttsText, filename)
+
 		if err != nil {
 			discord.ChannelMessageSend(message.ChannelID, "❌ TTS failed: "+err.Error())
 			return
@@ -159,6 +160,61 @@ func joinSameChannel(discord *discordgo.Session, message *discordgo.MessageCreat
 		discord.ChannelMessageSend(message.ChannelID, fmt.Sprintf("📢 Moved %d user(s) to your voice channel.", movedCount))
 	}()
 
+}
+
+func randomMoveSingle(discord *discordgo.Session, message *discordgo.MessageCreate) {
+	guildID := message.GuildID
+
+	go func() {
+		// Get the current voice state of the requester
+		requesterVoiceState, err := discord.State.VoiceState(guildID, message.Author.ID)
+
+		if err != nil || requesterVoiceState == nil || requesterVoiceState.ChannelID == "" {
+			discord.ChannelMessageSend(message.ChannelID, "❌ You must be in a voice channel to use this command.")
+			return
+		}
+
+		// Now we need to know what channel the requester is in
+		targetChannelID := requesterVoiceState.ChannelID
+
+		voiceChannels, err := gatherVoiceChannels(discord, message, guildID)
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "Failed to get voice channels: %v")
+			return
+		}
+
+		usersInVoice, err := gatherUsersVoiceStates(discord, message, guildID, targetChannelID)
+		if err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failure in gathering users in voice channels")
+			return
+		}
+
+		selectedVoice := usersInVoice[rand.Intn(len(usersInVoice))]
+
+		// Pick a random new channel (not the same one)
+		var possibleDestinations []string
+		for _, chID := range voiceChannels {
+			if chID != targetChannelID {
+				possibleDestinations = append(possibleDestinations, chID)
+			}
+		}
+
+		if len(possibleDestinations) == 0 {
+			discord.ChannelMessageSend(message.ChannelID, "❌ No other voice channels to move the user to.")
+			return
+		}
+
+		newChannelID := possibleDestinations[rand.Intn(len(possibleDestinations))]
+
+		err = discord.GuildMemberMove(guildID, selectedVoice.UserID, &newChannelID)
+		if err != nil {
+			log.Printf("Failed to move user: %v", err)
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to move the user.")
+			return
+		}
+
+		discord.ChannelMessageSend(message.ChannelID, fmt.Sprintf("<@%s> 🔫 Has Been Shot", selectedVoice.UserID))
+	}()
 }
 
 func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.MessageCreate) {
@@ -352,6 +408,7 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			"🎰 !gamble      → Spin the slot machine (big risk, big reward)\n" +
 			"📞 !recall      → Summon the whole squad to voice\n" +
 			"🛑 !kill        → Stop all current bot actions\n" +
+			"🔫 !shoot        → Wang Bot Shoots a Random User\n" +
 			"```"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
@@ -459,5 +516,9 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			joinSameChannel(discord, message)
 		}()
 
+	case strings.Contains(message.Content, "!shoot"):
+		go func() {
+			randomMoveSingle(discord, message)
+		}()
 	}
 }
