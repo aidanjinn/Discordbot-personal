@@ -40,13 +40,13 @@ func gatherUsersVoiceStates(discord *discordgo.Session, message *discordgo.Messa
 	var usersInVoice []*discordgo.VoiceState
 	if targetChannelID != "" {
 		for _, vs := range guild.VoiceStates {
-			usersInVoice = append(usersInVoice, vs)
-		}
-	} else {
-		for _, vs := range guild.VoiceStates {
 			if vs.ChannelID == targetChannelID {
 				usersInVoice = append(usersInVoice, vs)
 			}
+		}
+	} else {
+		for _, vs := range guild.VoiceStates {
+			usersInVoice = append(usersInVoice, vs)
 		}
 	}
 

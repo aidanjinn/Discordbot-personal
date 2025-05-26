@@ -222,35 +222,14 @@ func shuffleVoiceChannels(discord *discordgo.Session, message *discordgo.Message
 
 	// Run in goroutine to avoid blocking
 	go func() {
-		channels, err := discord.GuildChannels(guildID)
+
+		voiceChannels, err := gatherVoiceChannels(discord, message, guildID)
 		if err != nil {
-			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get guild channels.")
-			return
+			discord.ChannelMessageSend(message.ChannelID, "Failed to get voice channels: %v")
 		}
-
-		var voiceChannels []string
-		for _, channel := range channels {
-			if channel.Type == discordgo.ChannelTypeGuildVoice {
-				voiceChannels = append(voiceChannels, channel.ID)
-			}
-		}
-
-		if len(voiceChannels) < 1 {
-			discord.ChannelMessageSend(message.ChannelID, "❌ No voice channels found.")
-			return
-		}
-
-		guild, err := discord.State.Guild(guildID)
+		usersInVoice, err := gatherUsersVoiceStates(discord, message, guildID, "")
 		if err != nil {
-			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to get guild state.")
-			return
-		}
-
-		var usersInVoice []*discordgo.VoiceState
-		for _, vs := range guild.VoiceStates {
-			if vs.ChannelID != "" { // Only users actually in voice channels
-				usersInVoice = append(usersInVoice, vs)
-			}
+			discord.ChannelMessageSend(message.ChannelID, "Failed to get users voice states: %v")
 		}
 
 		if len(usersInVoice) < 1 {
