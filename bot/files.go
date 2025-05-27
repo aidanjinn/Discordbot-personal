@@ -118,7 +118,6 @@ func waitForfileReady(filename string, maxWait time.Duration) error {
 	return fmt.Errorf("file %s not ready after %v (last size: %d)", filename, maxWait, lastSize)
 }
 
-// Saves image and returns local path
 func downloadAttachment(url, filename string) (string, error) {
 	resp, err := http.Get(url)
 	if err != nil {

@@ -305,7 +305,6 @@ func handleImageMessage(discord *discordgo.Session, message *discordgo.MessageCr
 	attachment := message.Attachments[0]
 	imageURL := attachment.URL
 	filename := attachment.Filename
-	prompt := strings.TrimSpace(strings.Replace(message.Content, "!see", "", 1))
 
 	imagePath, err := downloadAttachment(imageURL, filename)
 	if err != nil {
@@ -315,7 +314,7 @@ func handleImageMessage(discord *discordgo.Session, message *discordgo.MessageCr
 	defer os.Remove(imagePath) // cleanup
 
 	ctx := context.Background()
-	response, err := imageProcess(ctx, imagePath, prompt)
+	response, err := imageProcess(ctx, imagePath, "")
 	if err != nil {
 		discord.ChannelMessageSend(message.ChannelID, "Gemini image processing failed: "+err.Error())
 		return
@@ -434,7 +433,7 @@ func handleUserJoinedVoice(s *discordgo.Session, vsu *discordgo.VoiceStateUpdate
 
 	// Join voice channel
 	vc, err := s.ChannelVoiceJoin(vsu.GuildID, after.ChannelID, false, false)
-	
+
 	// Create new voice session with context
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &VoiceSession{
@@ -495,44 +494,6 @@ func handleUserJoinedVoice(s *discordgo.Session, vsu *discordgo.VoiceStateUpdate
 
 }
 
-func onVoiceStateUpdate(s *discordgo.Session, vsu *discordgo.VoiceStateUpdate) {
-
-	log.Printf("Voice state update: %v", vsu)
-
-	// Skip if user shouldn't be tracked
-	if !shouldTrackUser(s, vsu.UserID) {
-		log.Printf("Should Not Track User: %v", vsu)
-		return
-	}
-
-	// Skip if not configured to announce for this specific user
-	if !shouldAnnounceForUser(vsu.GuildID, vsu.UserID) {
-		log.Printf("Should Not Annouce User: %v", vsu)
-		return
-	}
-
-	announceChannelID := getAnnouncementChannel(vsu.GuildID)
-
-	if announceChannelID == "" {
-		log.Print("No ChannelID given to announce:")
-		return
-	}
-
-	before := vsu.BeforeUpdate
-	after := vsu.VoiceState
-
-	userName := getUserDisplayName(s, vsu.GuildID, vsu.UserID)
-	switch {
-	//JOIN CHANNEL
-	case before == nil && after.ChannelID != "":
-		handleUserJoinedVoice(s, vsu, after, userName)
-
-	//SWITCH CHANNEL
-	case before != nil && before.ChannelID != after.ChannelID && after.ChannelID != "":
-		handleUserJoinedVoice(s, vsu, after, userName)
-	}
-}
-
 func handleTrackingCommands(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	guildID := message.GuildID
 	userID := message.Author.ID
@@ -571,6 +532,47 @@ func handleTrackingCommands(discord *discordgo.Session, message *discordgo.Messa
 			response = response[:1997] + "..."
 		}
 		discord.ChannelMessageSend(message.ChannelID, response)
+	}
+}
+
+/*
+There are the main handlers inside the bots main running thread
+*/
+func onVoiceStateUpdate(s *discordgo.Session, vsu *discordgo.VoiceStateUpdate) {
+
+	log.Printf("Voice state update: %v", vsu)
+
+	// Skip if user shouldn't be tracked
+	if !shouldTrackUser(s, vsu.UserID) {
+		log.Printf("Should Not Track User: %v", vsu)
+		return
+	}
+
+	// Skip if not configured to announce for this specific user
+	if !shouldAnnounceForUser(vsu.GuildID, vsu.UserID) {
+		log.Printf("Should Not Annouce User: %v", vsu)
+		return
+	}
+
+	announceChannelID := getAnnouncementChannel(vsu.GuildID)
+
+	if announceChannelID == "" {
+		log.Print("No ChannelID given to announce:")
+		return
+	}
+
+	before := vsu.BeforeUpdate
+	after := vsu.VoiceState
+
+	userName := getUserDisplayName(s, vsu.GuildID, vsu.UserID)
+	switch {
+	//JOIN CHANNEL
+	case before == nil && after.ChannelID != "":
+		handleUserJoinedVoice(s, vsu, after, userName)
+
+	//SWITCH CHANNEL
+	case before != nil && before.ChannelID != after.ChannelID && after.ChannelID != "":
+		handleUserJoinedVoice(s, vsu, after, userName)
 	}
 }
 
@@ -669,7 +671,7 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			sayHandler(discord, message, trimmed)
 		}()
 
-	case strings.HasPrefix(message.Content, "!see ") && len(message.Attachments) > 0:
+	case strings.Contains(message.Content, "!see") && len(message.Attachments) > 0:
 		go func() {
 			handleImageMessage(discord, message)
 		}()

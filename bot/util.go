@@ -8,6 +8,7 @@ import (
 	"os"
 )
 
+// get all the guild's voice channels
 func gatherVoiceChannels(discord *discordgo.Session, message *discordgo.MessageCreate, guildID string) ([]string, error) {
 	var voiceChannels []string
 	// now we gather all the guild channels
@@ -32,6 +33,7 @@ func gatherVoiceChannels(discord *discordgo.Session, message *discordgo.MessageC
 	return voiceChannels, nil
 }
 
+// get all the current user voice states
 func gatherUsersVoiceStates(discord *discordgo.Session, message *discordgo.MessageCreate, guildID string, targetChannelID string) ([]*discordgo.VoiceState, error) {
 
 	guild, err := discord.State.Guild(guildID)

@@ -273,7 +273,6 @@ func pcmToOpus(pcm []int16) []byte {
 	return opusBuf[:n]
 }
 
-// Verify audio file integrity before attempting to play
 func verifyAudioFile(filename string) error {
 	// Quick ffprobe check to verify file integrity
 	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",

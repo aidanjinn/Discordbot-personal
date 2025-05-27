@@ -127,7 +127,6 @@ func killAllOperations() {
 	cleanupAllTempFiles()
 }
 
-// Create a new operation context
 func createOperationContext(operationID string) context.Context {
 	operationsMu.Lock()
 	defer operationsMu.Unlock()
@@ -140,7 +139,6 @@ func createOperationContext(operationID string) context.Context {
 	return ctx
 }
 
-// Remove operation context
 func removeOperationContext(operationID string) {
 	operationsMu.Lock()
 	defer operationsMu.Unlock()
