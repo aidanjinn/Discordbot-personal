@@ -13,6 +13,7 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 	value := os.Getenv("BOT_TOKEN")
+
 	bot.BotToken = value
 	bot.Run()
 }

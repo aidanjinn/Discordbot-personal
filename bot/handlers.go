@@ -379,6 +379,7 @@ func imageGenerationHandler(discord *discordgo.Session, message *discordgo.Messa
 			attachment := message.Attachments[0]
 
 			if strings.HasPrefix(attachment.ContentType, "image/") {
+
 				// Download image to a temp file
 				resp, err := http.Get(attachment.URL)
 				if err != nil {
@@ -428,6 +429,151 @@ func imageGenerationHandler(discord *discordgo.Session, message *discordgo.Messa
 	}()
 }
 
+func handleUserJoinedVoice(s *discordgo.Session, vsu *discordgo.VoiceStateUpdate, after *discordgo.VoiceState, userName string) {
+	channelName := getChannelName(s, after.ChannelID)
+
+	// Join voice channel
+	vc, err := s.ChannelVoiceJoin(vsu.GuildID, after.ChannelID, false, false)
+	
+	// Create new voice session with context
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &VoiceSession{
+		connection: vc,
+		ctx:        ctx,
+		cancel:     cancel,
+		isPlaying:  false,
+	}
+
+	botManager.mu.Lock()
+	botManager.voiceConnections[vsu.GuildID] = session
+	botManager.mu.Unlock()
+
+	if err != nil {
+		log.Printf("Error joining voice channel: %v", err)
+		return
+	}
+
+	// Create or get existing session for this guild
+	session, ok := sessions[vsu.GuildID]
+	if !ok {
+		ctx, cancel := context.WithCancel(context.Background())
+		session = &VoiceSession{
+			connection: vc,
+			ctx:        ctx,
+			cancel:     cancel,
+		}
+		sessions[vsu.GuildID] = session
+	} else {
+		// If a session exists, replace connection if necessary
+		session.connection = vc
+	}
+
+	// Generate TTS text
+	ttsText := "Welcome to " + channelName + " " + userName
+
+	go func() {
+		filename := fmt.Sprintf("output_%d_%d.mp3", time.Now().Unix(), rand.Intn(10000))
+		opID := fmt.Sprintf("tts_gamble_%s_%d", vsu.GuildID, time.Now().Unix())
+		ctx2 := createOperationContext(opID)
+		defer removeOperationContext(opID)
+
+		log.Printf("TTS result: %s", ttsText)
+		err := synthesizeToMP3(ctx2, ttsText, filename)
+		if err != nil {
+			log.Printf("❌ TTS failed: %v", err)
+			return
+		}
+
+		// Play audio with your function
+		playMP3(session, filename, s, getAnnouncementChannel(vsu.GuildID))
+
+		// Optional: clean up file after some time
+		time.AfterFunc(30*time.Second, func() {
+			os.Remove(filename)
+		})
+	}()
+
+}
+
+func onVoiceStateUpdate(s *discordgo.Session, vsu *discordgo.VoiceStateUpdate) {
+
+	log.Printf("Voice state update: %v", vsu)
+
+	// Skip if user shouldn't be tracked
+	if !shouldTrackUser(s, vsu.UserID) {
+		log.Printf("Should Not Track User: %v", vsu)
+		return
+	}
+
+	// Skip if not configured to announce for this specific user
+	if !shouldAnnounceForUser(vsu.GuildID, vsu.UserID) {
+		log.Printf("Should Not Annouce User: %v", vsu)
+		return
+	}
+
+	announceChannelID := getAnnouncementChannel(vsu.GuildID)
+
+	if announceChannelID == "" {
+		log.Print("No ChannelID given to announce:")
+		return
+	}
+
+	before := vsu.BeforeUpdate
+	after := vsu.VoiceState
+
+	userName := getUserDisplayName(s, vsu.GuildID, vsu.UserID)
+	switch {
+	//JOIN CHANNEL
+	case before == nil && after.ChannelID != "":
+		handleUserJoinedVoice(s, vsu, after, userName)
+
+	//SWITCH CHANNEL
+	case before != nil && before.ChannelID != after.ChannelID && after.ChannelID != "":
+		handleUserJoinedVoice(s, vsu, after, userName)
+	}
+}
+
+func handleTrackingCommands(discord *discordgo.Session, message *discordgo.MessageCreate) {
+	guildID := message.GuildID
+	userID := message.Author.ID
+
+	switch {
+	case strings.Contains(message.Content, "!track me"):
+		if err := addTrackedUser(guildID, userID); err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to enable voice tracking: "+err.Error())
+			return
+		}
+		discord.ChannelMessageSend(message.ChannelID, "✅ You will now be announced when joining/leaving voice channels!")
+
+	case strings.Contains(message.Content, "!untrack me"):
+		if err := removeTrackedUser(guildID, userID); err != nil {
+			discord.ChannelMessageSend(message.ChannelID, "❌ Failed to disable voice tracking: "+err.Error())
+			return
+		}
+		discord.ChannelMessageSend(message.ChannelID, "❌ Voice announcements disabled for you.")
+
+	case strings.Contains(message.Content, "!tracked list"):
+		// Admin command to see who's being tracked
+		users := getTrackedUsersForGuild(guildID)
+		if len(users) == 0 {
+			discord.ChannelMessageSend(message.ChannelID, "📋 No users are currently being tracked for voice announcements.")
+			return
+		}
+
+		var userList string
+		for _, uid := range users {
+			userName := getUserDisplayName(discord, guildID, uid)
+			userList += fmt.Sprintf("• %s (`%s`)\n", userName, uid)
+		}
+
+		response := fmt.Sprintf("📋 **Tracked Users (%d):**\n%s", len(users), userList)
+		if len(response) > 2000 {
+			response = response[:1997] + "..."
+		}
+		discord.ChannelMessageSend(message.ChannelID, response)
+	}
+}
+
 func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 	if message.Author == nil || message.Author.ID == discord.State.User.ID {
 		return
@@ -445,14 +591,17 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			"📺 !ytplay      → Play audio from a YouTube link\n" +
 			"🔌 !connect     → Connect the bot to a voice channel\n" +
 			"❌ !disconnect  → Disconnect the bot from the voice channel\n" +
-			"🧠 !ask         → Ask Gemini AI (supports text + .jpg)\n" +
+			"🧠 !ask         → Ask Gemini AI (supports text + Image Attachments)\n" +
 			"🗣️ !say         → Make the bot speak using text-to-speech\n" +
 			"🔀 !shuffle     → Shuffle users in voice channels randomly\n" +
 			"🎰 !gamble      → Spin the slot machine (big risk, big reward)\n" +
 			"📞 !recall      → Summon the whole squad to voice\n" +
 			"🛑 !kill        → Stop all current bot actions\n" +
 			"🔫 !shoot        → Wang Bot Shoots a Random User\n" +
-			"🎨 !create      → Ask Wang Bot To Create an Image\n" +
+			"🎨 !create      → Ask Wang Bot To Create an Image (Image Attachments Supported)\n" +
+			"   !track me\n" +
+			"   !untrack me\n" +
+			"   !track list\n" +
 			"```"
 		discord.ChannelMessageSend(message.ChannelID, "Command List:\n"+commandList)
 
@@ -570,6 +719,13 @@ func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
 			trimmed := strings.TrimPrefix(message.Content, "!create ")
 			imageGenerationHandler(discord, message, trimmed, guildID)
 		}()
-	}
 
+	case strings.Contains(message.Content, "!track me"):
+		handleTrackingCommands(discord, message)
+	case strings.Contains(message.Content, "!untrack me"):
+		handleTrackingCommands(discord, message)
+	case strings.Contains(message.Content, "!tracked list"):
+		handleTrackingCommands(discord, message)
+
+	}
 }

@@ -112,7 +112,7 @@ func generateImageFromPrompt(ctx context.Context, prompt string, imagePath strin
 
 	// If an image is attached, upload it and include as a reference
 	if imagePath != "" {
-		mimeType := "image/png"
+		mimeType := "image/jpeg"
 
 		uploaded, err := client.Files.UploadFromPath(ctx, imagePath, &genai.UploadFileConfig{
 			MIMEType: mimeType,
@@ -140,11 +140,19 @@ func generateImageFromPrompt(ctx context.Context, prompt string, imagePath strin
 		contents,
 		config,
 	)
+
+	// If this happens most likely gemini was censored from returning an image
+	// Either due to the prompt, image given, or the output (ex: NSFW)
 	if err != nil {
 		return "", fmt.Errorf("Gemini image generation error: %w", err)
 	}
 
 	var outputFilename string
+
+	if len(result.Candidates) == 0 || result.Candidates[0].Content == nil {
+		return "", fmt.Errorf("no content in Gemini response")
+	}
+
 	for _, part := range result.Candidates[0].Content.Parts {
 		if part.Text != "" {
 			fmt.Println("Text response:", part.Text)

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"github.com/hraban/opus"
@@ -21,6 +22,28 @@ var tempFilesMu sync.RWMutex
 
 var activeOperations = make(map[string]*OperationContext)
 var operationsMu sync.RWMutex
+
+var configFilePath = "config.json"
+var sessions = make(map[string]*VoiceSession) // key: guildID
+var sessionsMu sync.Mutex
+
+// TrackedUsers represents the structure of our JSON file
+type TrackedUsers struct {
+	Guilds map[string]map[string]bool `json:"guilds"` // guildID -> userID -> enabled
+}
+
+type BotConfig struct {
+	TrackedUsers         TrackedUsers      `json:"tracked_users"`
+	AnnouncementChannels map[string]string `json:"announcement_channels"` // guildID -> channelID
+}
+
+// Global variables to hold tracked users data
+var (
+	trackedUsers  TrackedUsers
+	trackingMutex sync.RWMutex
+	jsonFilePath  = "tracked_users.json"
+	botConfig     BotConfig // Assuming this is defined elsewhere
+)
 
 type BotManager struct {
 	voiceConnections map[string]*VoiceSession
@@ -128,10 +151,45 @@ func removeOperationContext(operationID string) {
 	}
 }
 
+func loadBotConfig() error {
+	file, err := os.Open(configFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to open config file: %w", err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&botConfig); err != nil {
+		return fmt.Errorf("failed to decode config JSON: %w", err)
+	}
+
+	// Make sure maps are initialized
+	if botConfig.TrackedUsers.Guilds == nil {
+		botConfig.TrackedUsers.Guilds = make(map[string]map[string]bool)
+	}
+	if botConfig.AnnouncementChannels == nil {
+		botConfig.AnnouncementChannels = make(map[string]string)
+	}
+
+	return nil
+}
+
 func Run() {
+
+	if err := loadBotConfig(); err != nil {
+		log.Fatalf("Failed to load bot config: %v", err)
+	}
+
 	discord, err := discordgo.New("Bot " + BotToken)
 	checkNilErr(err)
 
+	// Initialize voice tracking
+	if err := initVoiceTracking(); err != nil {
+		log.Fatalf("Failed to initialize voice tracking: %v", err)
+	}
+
+	// Register the voice state update handler - ADD THIS LINE
+	discord.AddHandler(onVoiceStateUpdate)
 	discord.AddHandler(newMessage)
 
 	err = discord.Open()
